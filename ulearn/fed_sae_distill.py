@@ -6,9 +6,9 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 try:
-    from .sae import SparseAutoEncoder, sae_loss
+    from .sae import SparseAutoEncoder, sae_loss, latent_label_selective_loss
 except ImportError:
-    from sae import SparseAutoEncoder, sae_loss
+    from sae import SparseAutoEncoder, sae_loss, latent_label_selective_loss
 
 
 def sae_distill_loss(
@@ -16,8 +16,11 @@ def sae_distill_loss(
     x_hat_student,
     z_student,
     z_teacher,
+    label_ids=None,
+    num_labels=None,
     l1_lambda=1e-4,
     distill_lambda=1.0,
+    selective_lambda=0.0,
     distill_type="cosine",
 ):
     """
@@ -29,6 +32,11 @@ def sae_distill_loss(
     total_sae_loss, recon_loss, sparse_loss = sae_loss(
         x, x_hat_student, z_student, l1_lambda=l1_lambda
     )
+    selective_loss = latent_label_selective_loss(
+        z_student,
+        label_ids=label_ids,
+        num_labels=num_labels,
+    )
 
     if distill_type == "cosine":
         z_s = F.normalize(z_student, dim=1)
@@ -39,8 +47,8 @@ def sae_distill_loss(
     else:
         raise ValueError(f"Unsupported distill_type: {distill_type}")
 
-    total_loss = total_sae_loss + distill_lambda * distill_loss
-    return total_loss, recon_loss, sparse_loss, distill_loss
+    total_loss = total_sae_loss + distill_lambda * distill_loss + selective_lambda * selective_loss
+    return total_loss, recon_loss, sparse_loss, distill_loss, selective_loss
 
 
 def local_train_sae(
@@ -54,6 +62,7 @@ def local_train_sae(
     epochs=1,
     lr=1e-3,
     l1_lambda=1e-4,
+    selective_lambda=0.0,
     use_layer_norm=True,
     client_id=None,
 ):
@@ -83,6 +92,7 @@ def local_train_sae(
         total_loss_sum = 0.0
         recon_loss_sum = 0.0
         sparse_loss_sum = 0.0
+        selective_loss_sum = 0.0
         total_num = 0
 
         batch_bar = tqdm(
@@ -106,15 +116,25 @@ def local_train_sae(
                     return_label_emb=True,
                 )
 
+            label_ids = torch.arange(
+                label_emb.shape[1],
+                device=device
+            ).unsqueeze(0).expand(label_emb.shape[0], -1).reshape(-1)
             feat = label_emb.reshape(-1, label_emb.shape[-1])
             if use_layer_norm:
                 feat = F.layer_norm(feat, feat.shape[-1:])
 
             optimizer.zero_grad()
             x_hat, z = sae_model(feat)
-            loss, recon_loss, sparse_loss = sae_loss(
+            sae_total_loss, recon_loss, sparse_loss = sae_loss(
                 feat, x_hat, z, l1_lambda=l1_lambda
             )
+            selective_loss = latent_label_selective_loss(
+                z,
+                label_ids=label_ids,
+                num_labels=args.num_labels,
+            )
+            loss = sae_total_loss + selective_lambda * selective_loss
             loss.backward()
             optimizer.step()
 
@@ -122,6 +142,7 @@ def local_train_sae(
             total_loss_sum += loss.item() * bs
             recon_loss_sum += recon_loss.item() * bs
             sparse_loss_sum += sparse_loss.item() * bs
+            selective_loss_sum += selective_loss.item() * bs
             total_num += bs
 
             batch_bar.set_postfix({
@@ -129,12 +150,14 @@ def local_train_sae(
                 "loss": f"{loss.item():.5f}",
                 "recon": f"{recon_loss.item():.5f}",
                 "sparse": f"{sparse_loss.item():.5f}",
+                "selective": f"{selective_loss.item():.5f}",
             })
 
         epoch_log = {
             "total": total_loss_sum / max(total_num, 1),
             "recon": recon_loss_sum / max(total_num, 1),
             "sparse": sparse_loss_sum / max(total_num, 1),
+            "selective": selective_loss_sum / max(total_num, 1),
         }
         epoch_logs.append(epoch_log)
 
@@ -142,6 +165,7 @@ def local_train_sae(
             "total": f"{epoch_log['total']:.5f}",
             "recon": f"{epoch_log['recon']:.5f}",
             "sparse": f"{epoch_log['sparse']:.5f}",
+            "selective": f"{epoch_log['selective']:.5f}",
         })
 
     return sae_model, epoch_logs
@@ -160,6 +184,7 @@ def local_train_sae_with_distill(
     lr=1e-3,
     l1_lambda=1e-4,
     distill_lambda=1.0,
+    selective_lambda=0.0,
     distill_type="cosine",
     use_layer_norm=True,
     client_id=None,
@@ -196,6 +221,7 @@ def local_train_sae_with_distill(
         recon_loss_sum = 0.0
         sparse_loss_sum = 0.0
         distill_loss_sum = 0.0
+        selective_loss_sum = 0.0
         total_num = 0
 
         batch_bar = tqdm(
@@ -220,6 +246,10 @@ def local_train_sae_with_distill(
                     return_label_emb=True,
                 )
 
+            label_ids = torch.arange(
+                label_emb.shape[1],
+                device=device
+            ).unsqueeze(0).expand(label_emb.shape[0], -1).reshape(-1)
             # (B, L, D) -> (B*L, D)
             feat = label_emb.reshape(-1, label_emb.shape[-1])
 
@@ -237,13 +267,16 @@ def local_train_sae_with_distill(
             x_hat_student, z_student = student_sae(feat)
 
             # 4) 蒸馏版 SAE loss
-            loss, recon_loss, sparse_loss, distill_loss = sae_distill_loss(
+            loss, recon_loss, sparse_loss, distill_loss, selective_loss = sae_distill_loss(
                 feat,
                 x_hat_student,
                 z_student,
                 z_teacher,
+                label_ids=label_ids,
+                num_labels=args.num_labels,
                 l1_lambda=l1_lambda,
                 distill_lambda=distill_lambda,
+                selective_lambda=selective_lambda,
                 distill_type=distill_type,
             )
 
@@ -255,6 +288,7 @@ def local_train_sae_with_distill(
             recon_loss_sum += recon_loss.item() * bs
             sparse_loss_sum += sparse_loss.item() * bs
             distill_loss_sum += distill_loss.item() * bs
+            selective_loss_sum += selective_loss.item() * bs
             total_num += bs
 
             batch_bar.set_postfix({
@@ -263,6 +297,7 @@ def local_train_sae_with_distill(
                 "recon": f"{recon_loss.item():.5f}",
                 "sparse": f"{sparse_loss.item():.5f}",
                 "distill": f"{distill_loss.item():.5f}",
+                "selective": f"{selective_loss.item():.5f}",
             })
 
         epoch_log = {
@@ -270,6 +305,7 @@ def local_train_sae_with_distill(
             "recon": recon_loss_sum / max(total_num, 1),
             "sparse": sparse_loss_sum / max(total_num, 1),
             "distill": distill_loss_sum / max(total_num, 1),
+            "selective": selective_loss_sum / max(total_num, 1),
         }
         epoch_logs.append(epoch_log)
 
@@ -278,6 +314,7 @@ def local_train_sae_with_distill(
             "recon": f"{epoch_log['recon']:.5f}",
             "sparse": f"{epoch_log['sparse']:.5f}",
             "distill": f"{epoch_log['distill']:.5f}",
+            "selective": f"{epoch_log['selective']:.5f}",
         })
 
     return student_sae, epoch_logs
@@ -325,6 +362,7 @@ def federated_train_sae(
     sae_local_epochs=1,
     sae_lr=1e-3,
     l1_lambda=1e-4,
+    selective_lambda=0.0,
 ):
     """
     联邦普通 SAE 训练（无蒸馏）
@@ -380,6 +418,7 @@ def federated_train_sae(
                 epochs=sae_local_epochs,
                 lr=sae_lr,
                 l1_lambda=l1_lambda,
+                selective_lambda=selective_lambda,
                 use_layer_norm=True,
                 client_id=client_id,
             )
@@ -398,6 +437,7 @@ def federated_train_sae(
                 "samples": len(sub_dst),
                 "total": f"{last_log['total']:.5f}",
                 "recon": f"{last_log['recon']:.5f}",
+                "selective": f"{last_log['selective']:.5f}",
             })
 
             del local_sae
@@ -412,18 +452,21 @@ def federated_train_sae(
         mean_total = np_mean([c["epoch_logs"][-1]["total"] for c in client_logs])
         mean_recon = np_mean([c["epoch_logs"][-1]["recon"] for c in client_logs])
         mean_sparse = np_mean([c["epoch_logs"][-1]["sparse"] for c in client_logs])
+        mean_selective = np_mean([c["epoch_logs"][-1]["selective"] for c in client_logs])
 
         round_bar.set_postfix({
             "mean_total": f"{mean_total:.5f}",
             "mean_recon": f"{mean_recon:.5f}",
             "mean_sparse": f"{mean_sparse:.5f}",
+            "mean_selective": f"{mean_selective:.5f}",
         })
 
         print(
             f"\n[Warmup SAE Round {r+1}/{sae_rounds}] "
             f"mean_total={mean_total:.6f} "
             f"mean_recon={mean_recon:.6f} "
-            f"mean_sparse={mean_sparse:.6f}"
+            f"mean_sparse={mean_sparse:.6f} "
+            f"mean_selective={mean_selective:.6f}"
         )
 
         round_logs.append({
@@ -432,6 +475,7 @@ def federated_train_sae(
             "round_mean_total": mean_total,
             "round_mean_recon": mean_recon,
             "round_mean_sparse": mean_sparse,
+            "round_mean_selective": mean_selective,
         })
 
     return global_sae, round_logs
@@ -451,6 +495,7 @@ def federated_train_sae_with_distill(
     sae_lr=1e-3,
     l1_lambda=1e-4,
     distill_lambda=1.0,
+    selective_lambda=0.0,
     distill_type="cosine",
 ):
     """
@@ -515,6 +560,7 @@ def federated_train_sae_with_distill(
                 lr=sae_lr,
                 l1_lambda=l1_lambda,
                 distill_lambda=distill_lambda,
+                selective_lambda=selective_lambda,
                 distill_type=distill_type,
                 use_layer_norm=True,
                 client_id=client_id,
@@ -534,6 +580,7 @@ def federated_train_sae_with_distill(
                 "samples": len(sub_dst),
                 "total": f"{last_log['total']:.5f}",
                 "distill": f"{last_log['distill']:.5f}",
+                "selective": f"{last_log['selective']:.5f}",
             })
 
             del teacher_sae
@@ -551,12 +598,14 @@ def federated_train_sae_with_distill(
         mean_recon = np_mean([c["epoch_logs"][-1]["recon"] for c in client_logs])
         mean_sparse = np_mean([c["epoch_logs"][-1]["sparse"] for c in client_logs])
         mean_distill = np_mean([c["epoch_logs"][-1]["distill"] for c in client_logs])
+        mean_selective = np_mean([c["epoch_logs"][-1]["selective"] for c in client_logs])
 
         round_bar.set_postfix({
             "mean_total": f"{mean_total:.5f}",
             "mean_recon": f"{mean_recon:.5f}",
             "mean_sparse": f"{mean_sparse:.5f}",
             "mean_distill": f"{mean_distill:.5f}",
+            "mean_selective": f"{mean_selective:.5f}",
         })
 
         print(
@@ -564,7 +613,8 @@ def federated_train_sae_with_distill(
             f"mean_total={mean_total:.6f} "
             f"mean_recon={mean_recon:.6f} "
             f"mean_sparse={mean_sparse:.6f} "
-            f"mean_distill={mean_distill:.6f}"
+            f"mean_distill={mean_distill:.6f} "
+            f"mean_selective={mean_selective:.6f}"
         )
 
         round_logs.append({
@@ -574,6 +624,7 @@ def federated_train_sae_with_distill(
             "round_mean_recon": mean_recon,
             "round_mean_sparse": mean_sparse,
             "round_mean_distill": mean_distill,
+            "round_mean_selective": mean_selective,
         })
 
     return global_sae, round_logs

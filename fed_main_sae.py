@@ -19,6 +19,7 @@ import clip
 import json
 import csv
 import copy
+import re
 
 from scipy.special import softmax
 
@@ -487,10 +488,6 @@ if __name__ == '__main__':
 
     # ====== 训练 SAE（供 latent Top-K 使用） ======
     print("==== Start federated SAE warmup + distillation ====")
-    sae_warmup_path = os.path.join("ulearn", "sae_512_to_1024.pth")
-    sae_distill_path = os.path.join("ulearn_model", "fed_sae_distill.pth")
-    sae_warmup_log_path = os.path.join(args.results_new, "fed_sae_warmup_round_logs.json")
-    sae_round_log_path = os.path.join(args.results_new, "fed_sae_distill_round_logs.json")
 
     sae_input_dim = 512
     sae_latent_dim = 1024
@@ -503,7 +500,14 @@ if __name__ == '__main__':
     sae_lr = getattr(args, "sae_lr", 1e-3)
     sae_distill_lambda = getattr(args, "sae_distill_lambda", 1.0)
     sae_distill_type = getattr(args, "sae_distill_type", "cosine")
+    sae_selective_lambda = getattr(args, "sae_selective_lambda", 0.05)
     use_sae_distill = not getattr(args, "disable_sae_distill", False)
+
+    selective_tag = re.sub(r"[^0-9a-zA-Z]+", "p", f"sel{sae_selective_lambda:g}")
+    sae_warmup_path = os.path.join("ulearn", f"sae_512_to_1024_{selective_tag}.pth")
+    sae_distill_path = os.path.join("ulearn_model", f"fed_sae_distill_{selective_tag}.pth")
+    sae_warmup_log_path = os.path.join(args.results_new, f"fed_sae_warmup_round_logs_{selective_tag}.json")
+    sae_round_log_path = os.path.join(args.results_new, f"fed_sae_distill_round_logs_{selective_tag}.json")
 
     if not os.path.exists(sae_warmup_path):
         print("==== Start federated SAE warmup ====")
@@ -526,6 +530,7 @@ if __name__ == '__main__':
             sae_local_epochs=sae_warmup_local_epochs,
             sae_lr=sae_lr,
             l1_lambda=sae_l1_lambda,
+            selective_lambda=sae_selective_lambda,
         )
         os.makedirs(os.path.dirname(sae_warmup_path), exist_ok=True)
         os.makedirs(args.results_new, exist_ok=True)
@@ -562,6 +567,7 @@ if __name__ == '__main__':
             sae_lr=sae_lr,
             l1_lambda=sae_l1_lambda,
             distill_lambda=sae_distill_lambda,
+            selective_lambda=sae_selective_lambda,
             distill_type=sae_distill_type,
         )
 
@@ -585,6 +591,7 @@ if __name__ == '__main__':
     args.sae_input_dim = sae_input_dim
     args.sae_latent_dim = sae_latent_dim
     args.sae_activation = sae_activation
+    args.sae_selective_lambda = sae_selective_lambda
     args.sae_use_layer_norm = True
 
     # ====== 联邦单类遗忘（完整版） + 按类别表格 ======

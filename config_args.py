@@ -15,6 +15,12 @@ def get_args(parser,eval=False):
     parser.add_argument('--forget_cls', type=int, default=2)
     parser.add_argument('--k', type=int, default=64)
     parser.add_argument(
+        '--sae_selective_lambda',
+        type=float,
+        default=0.05,
+        help='weight for SAE latent label-selectivity entropy regularizer'
+    )
+    parser.add_argument(
         '--disable_sae_distill',
         action='store_true',
         help='skip federated SAE distillation and use warmup SAE directly for unlearning'
