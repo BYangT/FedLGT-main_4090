@@ -1292,7 +1292,7 @@ def rerank_topk_dims_with_gradient(
 
         model.zero_grad(set_to_none=True)
 
-        logits, _, _, label_emb = model(
+        _, _, _, label_emb = model(
             images,
             mask.clone(),
             args.learn_emb_type,
@@ -1302,17 +1302,24 @@ def rerank_topk_dims_with_gradient(
         )
 
         z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)
+        if not z_all.requires_grad:
+            # 极端情况下如果上游前向把 label_emb 脱图了，就回退到原始候选分数。
+            continue
         z_all.retain_grad()
 
-        target_logits = logits[pos_idx, forget_cls]
-        rank_loss = F.binary_cross_entropy_with_logits(
-            target_logits,
-            torch.ones_like(target_logits),
-            reduction="mean",
-        )
+        z_f = z_all[:, forget_cls, :]
+        z_pos_full = z_f[pos_idx]
+        z_pos = z_pos_full[:, candidate_idx]
+        neg_idx = labels[:, forget_cls] == 0
+
+        if neg_idx.any():
+            z_neg = z_f[neg_idx][:, candidate_idx]
+            mu_neg = z_neg.detach().mean(dim=0, keepdim=True)
+            rank_loss = 0.8 * (z_pos ** 2).mean() + 0.2 * ((z_pos - mu_neg) ** 2).mean()
+        else:
+            rank_loss = (z_pos ** 2).mean()
         rank_loss.backward()
 
-        z_pos = z_all[pos_idx, forget_cls, :][:, candidate_idx]
         g_pos = z_all.grad[pos_idx, forget_cls, :][:, candidate_idx]
 
         n_pos = z_pos.size(0)
