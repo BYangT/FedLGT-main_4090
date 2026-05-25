@@ -4,11 +4,12 @@ import random
 import torch
 import gc
 import copy
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 from tqdm import tqdm
 
 from ulearn.unlearn_utils_topklogit import (
     collect_topk_dims_for_class,
+    rerank_topk_dims_with_gradient,
     unlearn_one_class_on_model,
 )
 
@@ -147,12 +148,56 @@ def federated_unlearn_one_class_topklogit(
         else:
             global_score += w * score_local
 
-    # 计算 Global Top-K
+    # ========= 1.5) 低算力重排：top-M 候选 -> 小样本梯度敏感度 -> 去冗余 top-K =========
     K_eff = min(K, global_score.numel())
-    topk_val, topk_idx_global = torch.topk(global_score, k=K_eff)
-    print(f"[TopK+Logit-Fed] Global top-{K_eff} dims calculated.")
+    candidate_mul = max(1.0, float(getattr(args, "topk_candidate_mul", 2.0)))
+    candidate_M = min(global_score.numel(), max(K_eff, int(round(K_eff * candidate_mul))))
+    candidate_val, candidate_idx = torch.topk(global_score, k=candidate_M)
 
-    topk_idx_global = topk_idx_global.to(device)
+    rerank_client_n = max(1, int(getattr(args, "topk_rerank_clients", 2)))
+    rerank_batch_n = max(1, int(getattr(args, "topk_rerank_batches", 3)))
+    rerank_alpha = float(getattr(args, "topk_rerank_alpha", 0.5))
+    rerank_beta = float(getattr(args, "topk_rerank_beta", 0.5))
+    rerank_gamma = float(getattr(args, "topk_rerank_gamma", 0.2))
+
+    rerank_clients = sorted(
+        candidate_clients,
+        key=lambda cid: client_pos_count[cid],
+        reverse=True,
+    )[:rerank_client_n]
+    rerank_dataset = ConcatDataset([
+        Subset(train_dl_global.dataset, partition_idx_map[cid]) for cid in rerank_clients
+    ])
+    rerank_loader = DataLoader(
+        rerank_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        drop_last=False,
+    )
+
+    global_model.load_state_dict(global_state_dict)
+    topk_idx_global, topk_weight_global = rerank_topk_dims_with_gradient(
+        model=global_model,
+        dataloader=rerank_loader,
+        forget_cls=forget_cls,
+        candidate_idx=candidate_idx,
+        candidate_score=candidate_val,
+        final_k=K_eff,
+        device=device,
+        args=args,
+        emb_feat=emb_feat,
+        clip_model=clip_model,
+        max_batches=rerank_batch_n,
+        alpha=rerank_alpha,
+        beta=rerank_beta,
+        gamma=rerank_gamma,
+    )
+    global_model.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    print(f"[TopK+Logit-Fed] Global reranked top-{K_eff} dims calculated from candidate_M={candidate_M}.")
 
     # ========= 2) 多轮联邦遗忘 =========
     for ur in range(unlearn_rounds):
@@ -212,6 +257,7 @@ def federated_unlearn_one_class_topklogit(
                     dataloader=local_loader,
                     forget_cls=forget_cls,
                     topk_idx=topk_idx_global,
+                    topk_weights=topk_weight_global,
                     device=device,
                     args=args,
                     emb_feat=emb_feat,

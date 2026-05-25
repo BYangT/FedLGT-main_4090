@@ -23,7 +23,7 @@ def get_args(parser,eval=False):
     parser.add_argument(
         '--sae_overlap_lambda',
         type=float,
-        default=0.1,
+        default=0.0,
         help='weight for target-vs-coupled-label latent overlap penalty during SAE training'
     )
     parser.add_argument(
@@ -35,8 +35,44 @@ def get_args(parser,eval=False):
     parser.add_argument(
         '--topk_coupling_lambda',
         type=float,
-        default=0.5,
+        default=0.0,
         help='penalty weight for subtracting high-coupling label responses in top-K scoring'
+    )
+    parser.add_argument(
+        '--topk_candidate_mul',
+        type=float,
+        default=2.0,
+        help='candidate multiplier M/K for cheap top-K reranking'
+    )
+    parser.add_argument(
+        '--topk_rerank_batches',
+        type=int,
+        default=3,
+        help='number of small batches used for gradient-sensitivity reranking'
+    )
+    parser.add_argument(
+        '--topk_rerank_clients',
+        type=int,
+        default=2,
+        help='number of high-positive clients used to build the rerank subset'
+    )
+    parser.add_argument(
+        '--topk_rerank_alpha',
+        type=float,
+        default=0.5,
+        help='weight for original score in top-K reranking'
+    )
+    parser.add_argument(
+        '--topk_rerank_beta',
+        type=float,
+        default=0.5,
+        help='weight for gradient sensitivity in top-K reranking'
+    )
+    parser.add_argument(
+        '--topk_rerank_gamma',
+        type=float,
+        default=0.2,
+        help='redundancy penalty weight in top-K reranking'
     )
     parser.add_argument(
         '--disable_sae_distill',

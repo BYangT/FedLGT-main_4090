@@ -1229,6 +1229,149 @@ def collect_topk_dims_for_class(
     return topk_idx, score
 
 
+def _minmax_normalize(x, eps=1e-8):
+    if x.numel() == 0:
+        return x
+    x_min = x.min()
+    x_max = x.max()
+    if (x_max - x_min).abs() <= eps:
+        return torch.ones_like(x)
+    return (x - x_min) / (x_max - x_min + eps)
+
+
+def rerank_topk_dims_with_gradient(
+    model,
+    dataloader,
+    forget_cls: int,
+    candidate_idx: torch.Tensor,
+    candidate_score: torch.Tensor,
+    final_k: int,
+    device,
+    args,
+    emb_feat,
+    clip_model,
+    max_batches: int = 3,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    gamma: float = 0.2,
+):
+    """
+    低算力重排：
+    1) 原始 score 先筛出 top-M 候选
+    2) 只在少量目标类样本 batch 上，用一次反向传播拿候选维的梯度敏感度
+    3) 再做去冗余贪心选择，得到最终 top-K 和对应权重
+    """
+    model.eval()
+    model.to(device)
+
+    sae_model = _get_sae_model(args, device)
+    sae_model.eval()
+
+    candidate_idx = candidate_idx.to(device)
+    candidate_score = candidate_score.to(device)
+    M = candidate_idx.numel()
+    if M == 0:
+        return candidate_idx, torch.empty(0, device=device)
+
+    importance_sum = torch.zeros(M, device=device)
+    sample_count = 0
+    z_samples = []
+
+    batch_seen = 0
+    for batch in dataloader:
+        if batch_seen >= max_batches:
+            break
+
+        images = batch["image"].float().to(device)
+        labels = batch["labels"].float().to(device)
+        mask = batch["mask"].float().to(device)
+
+        pos_idx = labels[:, forget_cls] == 1
+        if not pos_idx.any():
+            continue
+
+        model.zero_grad(set_to_none=True)
+
+        logits, _, _, label_emb = model(
+            images,
+            mask.clone(),
+            args.learn_emb_type,
+            emb_feat,
+            clip_model,
+            return_label_emb=True,
+        )
+
+        z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)
+        z_all.retain_grad()
+
+        target_logits = logits[pos_idx, forget_cls]
+        rank_loss = F.binary_cross_entropy_with_logits(
+            target_logits,
+            torch.ones_like(target_logits),
+            reduction="mean",
+        )
+        rank_loss.backward()
+
+        z_pos = z_all[pos_idx, forget_cls, :][:, candidate_idx]
+        g_pos = z_all.grad[pos_idx, forget_cls, :][:, candidate_idx]
+
+        n_pos = z_pos.size(0)
+        importance_sum += (z_pos.abs() * g_pos.abs()).sum(dim=0)
+        sample_count += n_pos
+        z_samples.append(z_pos.detach().cpu())
+        batch_seen += 1
+
+    if sample_count == 0:
+        weight = torch.softmax(candidate_score[:min(final_k, M)], dim=0)
+        return candidate_idx[:min(final_k, M)], weight
+
+    importance = importance_sum / float(sample_count)
+
+    # 候选维去冗余：利用少量目标类样本上的候选激活相关性。
+    z_cat = torch.cat(z_samples, dim=0)
+    if z_cat.size(0) >= 2:
+        z_centered = z_cat - z_cat.mean(dim=0, keepdim=True)
+        denom = z_centered.pow(2).sum(dim=0).sqrt().clamp_min(1e-6)
+        z_norm = z_centered / denom
+        corr = (z_norm.t() @ z_norm) / max(z_norm.size(0) - 1, 1)
+        corr = corr.abs().clamp(max=1.0).to(device)
+        corr.fill_diagonal_(0.0)
+    else:
+        corr = torch.zeros((M, M), device=device)
+
+    score_norm = _minmax_normalize(candidate_score)
+    imp_norm = _minmax_normalize(importance)
+    combined = alpha * score_norm + beta * imp_norm
+
+    k_eff = min(final_k, M)
+    selected = []
+    selected_mask = torch.zeros(M, dtype=torch.bool, device=device)
+
+    for _ in range(k_eff):
+        if len(selected) == 0:
+            cur_score = combined.clone()
+        else:
+            red = corr[:, selected].max(dim=1).values
+            cur_score = combined - gamma * red
+        cur_score[selected_mask] = -1e9
+        pick = int(torch.argmax(cur_score).item())
+        selected.append(pick)
+        selected_mask[pick] = True
+
+    selected_idx = torch.tensor(selected, device=device, dtype=torch.long)
+    final_idx = candidate_idx[selected_idx]
+    final_raw = combined[selected_idx].clamp_min(1e-6)
+    final_weight = final_raw / final_raw.sum().clamp_min(1e-6)
+
+    print(
+        f"[Rerank] candidate_M={M}, final_K={k_eff}, "
+        f"mean_base={candidate_score.mean().item():.4f}, "
+        f"mean_importance={importance.mean().item():.4f}"
+    )
+
+    return final_idx, final_weight
+
+
 def unlearn_one_class_on_model_topk_logit(
     model,
     dataloader,
@@ -1243,6 +1386,7 @@ def unlearn_one_class_on_model_topk_logit(
     lambda_forget_logit: float = 0.0,
     lambda_forget_feat: float = 1.0,
     lr: float = 1e-4,
+    topk_weights: torch.Tensor = None,
 ):
     """
     “top-K latent 维 + logits 惩罚” 单模型遗忘版本（SAE latent 版）
@@ -1266,6 +1410,8 @@ def unlearn_one_class_on_model_topk_logit(
 
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
+    if topk_weights is not None:
+        topk_weights = topk_weights.to(device).view(1, -1)
 
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1324,7 +1470,10 @@ def unlearn_one_class_on_model_topk_logit(
                 z_f = z_all[:, forget_cls, :]       # (B, latent_dim)
                 z_pos = z_f[pos_idx]                # (N_pos, latent_dim)
                 z_pos_topk = z_pos[:, topk_idx]     # (N_pos, K)
-                loss_forget_feat = (z_pos_topk ** 2).mean()
+                if topk_weights is None:
+                    loss_forget_feat = (z_pos_topk ** 2).mean()
+                else:
+                    loss_forget_feat = ((z_pos_topk ** 2) * topk_weights).sum(dim=1).mean()
             else:
                 loss_forget_feat = torch.tensor(0.0, device=device)
 
@@ -1367,6 +1516,7 @@ def unlearn_one_class_on_model(
     lambda_forget_logit: float = 5.0,
     lambda_forget_feat: float = 1.0,
     lr: float = 1e-4,
+    topk_weights: torch.Tensor = None,
 ):
     """
     方案二（保护版，SAE latent 版）：
@@ -1385,6 +1535,8 @@ def unlearn_one_class_on_model(
 
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
+    if topk_weights is not None:
+        topk_weights = topk_weights.to(device).view(1, -1)
     print("【保护版】只更新 head(Person) + backbone.layer4")
 
     # ===== ① 先把所有参数默认冻结 =====
@@ -1500,8 +1652,12 @@ def unlearn_one_class_on_model(
 
                 mu_neg_topk = z_neg_topk.mean(dim=0, keepdim=True)
 
-                loss_shrink = (z_pos_topk ** 2).mean()
-                loss_pull_neg = ((z_pos_topk - mu_neg_topk) ** 2).mean()
+                if topk_weights is None:
+                    loss_shrink = (z_pos_topk ** 2).mean()
+                    loss_pull_neg = ((z_pos_topk - mu_neg_topk) ** 2).mean()
+                else:
+                    loss_shrink = ((z_pos_topk ** 2) * topk_weights).sum(dim=1).mean()
+                    loss_pull_neg = (((z_pos_topk - mu_neg_topk) ** 2) * topk_weights).sum(dim=1).mean()
 
                 loss_forget_feat = 0.8 * loss_shrink + 0.2 * loss_pull_neg
             else:
