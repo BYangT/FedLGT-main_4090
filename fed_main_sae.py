@@ -501,9 +501,16 @@ if __name__ == '__main__':
     sae_distill_lambda = getattr(args, "sae_distill_lambda", 1.0)
     sae_distill_type = getattr(args, "sae_distill_type", "cosine")
     sae_selective_lambda = getattr(args, "sae_selective_lambda", 0.05)
+    sae_overlap_lambda = getattr(args, "sae_overlap_lambda", 0.1)
+    sae_coupling_topm = getattr(args, "sae_coupling_topm", 5)
+    topk_coupling_lambda = getattr(args, "topk_coupling_lambda", 0.5)
     use_sae_distill = not getattr(args, "disable_sae_distill", False)
 
-    selective_tag = re.sub(r"[^0-9a-zA-Z]+", "p", f"sel{sae_selective_lambda:g}")
+    selective_tag = re.sub(
+        r"[^0-9a-zA-Z]+",
+        "p",
+        f"sel{sae_selective_lambda:g}_ov{sae_overlap_lambda:g}_ct{sae_coupling_topm}_tk{topk_coupling_lambda:g}",
+    )
     sae_warmup_path = os.path.join("ulearn", f"sae_512_to_1024_{selective_tag}.pth")
     sae_distill_path = os.path.join("ulearn_model", f"fed_sae_distill_{selective_tag}.pth")
     sae_warmup_log_path = os.path.join(args.results_new, f"fed_sae_warmup_round_logs_{selective_tag}.json")
@@ -531,6 +538,8 @@ if __name__ == '__main__':
             sae_lr=sae_lr,
             l1_lambda=sae_l1_lambda,
             selective_lambda=sae_selective_lambda,
+            overlap_lambda=sae_overlap_lambda,
+            coupling_topm=sae_coupling_topm,
         )
         os.makedirs(os.path.dirname(sae_warmup_path), exist_ok=True)
         os.makedirs(args.results_new, exist_ok=True)
@@ -568,6 +577,8 @@ if __name__ == '__main__':
             l1_lambda=sae_l1_lambda,
             distill_lambda=sae_distill_lambda,
             selective_lambda=sae_selective_lambda,
+            overlap_lambda=sae_overlap_lambda,
+            coupling_topm=sae_coupling_topm,
             distill_type=sae_distill_type,
         )
 
@@ -592,6 +603,9 @@ if __name__ == '__main__':
     args.sae_latent_dim = sae_latent_dim
     args.sae_activation = sae_activation
     args.sae_selective_lambda = sae_selective_lambda
+    args.sae_overlap_lambda = sae_overlap_lambda
+    args.sae_coupling_topm = sae_coupling_topm
+    args.topk_coupling_lambda = topk_coupling_lambda
     args.sae_use_layer_norm = True
 
     # ====== 联邦单类遗忘（完整版） + 按类别表格 ======

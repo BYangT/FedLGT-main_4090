@@ -21,6 +21,24 @@ def get_args(parser,eval=False):
         help='weight for SAE latent label-selectivity entropy regularizer'
     )
     parser.add_argument(
+        '--sae_overlap_lambda',
+        type=float,
+        default=0.1,
+        help='weight for target-vs-coupled-label latent overlap penalty during SAE training'
+    )
+    parser.add_argument(
+        '--sae_coupling_topm',
+        type=int,
+        default=5,
+        help='number of high-coupling labels used in SAE overlap penalty and top-K penalty'
+    )
+    parser.add_argument(
+        '--topk_coupling_lambda',
+        type=float,
+        default=0.5,
+        help='penalty weight for subtracting high-coupling label responses in top-K scoring'
+    )
+    parser.add_argument(
         '--disable_sae_distill',
         action='store_true',
         help='skip federated SAE distillation and use warmup SAE directly for unlearning'

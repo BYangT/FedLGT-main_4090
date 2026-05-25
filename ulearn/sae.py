@@ -105,6 +105,74 @@ def latent_label_selective_loss(z, label_ids, num_labels, eps=1e-8):
     return entropy.mean()
 
 
+def get_batch_coupled_label_stats(labels, forget_cls, top_m=5, eps=1e-8):
+    """
+    根据 batch 内目标类正样本，统计与 forget_cls 高耦合的标签。
+    返回:
+    - coupled_ids: (M,)
+    - coupled_weights: (M,)
+    """
+    if labels is None or labels.numel() == 0:
+        device = labels.device if labels is not None else "cpu"
+        return torch.empty(0, dtype=torch.long, device=device), torch.empty(0, device=device)
+
+    pos_idx = labels[:, forget_cls] > 0.5
+    if not pos_idx.any():
+        return torch.empty(0, dtype=torch.long, device=labels.device), torch.empty(0, device=labels.device)
+
+    co_counts = labels[pos_idx].sum(dim=0)
+    co_counts = co_counts.clone()
+    co_counts[forget_cls] = 0.0
+    valid_mask = co_counts > 0
+    if not valid_mask.any():
+        return torch.empty(0, dtype=torch.long, device=labels.device), torch.empty(0, device=labels.device)
+
+    top_m = min(int(top_m), int(valid_mask.sum().item()))
+    vals, idx = torch.topk(co_counts, k=top_m, largest=True)
+    weights = vals / vals.sum().clamp_min(eps)
+    return idx.long(), weights
+
+
+def latent_coupling_overlap_loss(z_all, labels, forget_cls, coupled_ids, coupled_weights, eps=1e-8):
+    """
+    目标类与高耦合类重叠惩罚：
+    - 对 forget_cls 的 latent 原型，与高耦合标签的 latent 原型做 cosine
+    - 希望它们不要太像
+
+    参数:
+    - z_all: (B, L, latent_dim)
+    - labels: (B, L)
+    """
+    if coupled_ids is None or coupled_ids.numel() == 0:
+        return z_all.new_zeros(())
+
+    target_mask = labels[:, forget_cls] > 0.5
+    if not target_mask.any():
+        return z_all.new_zeros(())
+
+    target_proto = z_all[target_mask, forget_cls, :].abs().mean(dim=0, keepdim=True)
+    if target_proto.abs().sum() <= eps:
+        return z_all.new_zeros(())
+
+    total_loss = z_all.new_zeros(())
+    total_weight = z_all.new_zeros(())
+
+    for cls_id, cls_weight in zip(coupled_ids.tolist(), coupled_weights):
+        cls_mask = labels[:, cls_id] > 0.5
+        if not cls_mask.any():
+            continue
+        cls_proto = z_all[cls_mask, cls_id, :].abs().mean(dim=0, keepdim=True)
+        if cls_proto.abs().sum() <= eps:
+            continue
+        overlap = F.cosine_similarity(target_proto, cls_proto, dim=1).mean()
+        total_loss = total_loss + cls_weight * overlap
+        total_weight = total_weight + cls_weight
+
+    if total_weight.abs() <= eps:
+        return z_all.new_zeros(())
+    return total_loss / total_weight.clamp_min(eps)
+
+
 @torch.no_grad()
 def get_sae_sparsity(z, eps=1e-8):
     """

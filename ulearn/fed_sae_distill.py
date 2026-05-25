@@ -6,9 +6,21 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 try:
-    from .sae import SparseAutoEncoder, sae_loss, latent_label_selective_loss
+    from .sae import (
+        SparseAutoEncoder,
+        sae_loss,
+        latent_label_selective_loss,
+        get_batch_coupled_label_stats,
+        latent_coupling_overlap_loss,
+    )
 except ImportError:
-    from sae import SparseAutoEncoder, sae_loss, latent_label_selective_loss
+    from sae import (
+        SparseAutoEncoder,
+        sae_loss,
+        latent_label_selective_loss,
+        get_batch_coupled_label_stats,
+        latent_coupling_overlap_loss,
+    )
 
 
 def sae_distill_loss(
@@ -21,6 +33,8 @@ def sae_distill_loss(
     l1_lambda=1e-4,
     distill_lambda=1.0,
     selective_lambda=0.0,
+    overlap_loss=None,
+    overlap_lambda=0.0,
     distill_type="cosine",
 ):
     """
@@ -47,8 +61,16 @@ def sae_distill_loss(
     else:
         raise ValueError(f"Unsupported distill_type: {distill_type}")
 
-    total_loss = total_sae_loss + distill_lambda * distill_loss + selective_lambda * selective_loss
-    return total_loss, recon_loss, sparse_loss, distill_loss, selective_loss
+    if overlap_loss is None:
+        overlap_loss = z_student.new_zeros(())
+
+    total_loss = (
+        total_sae_loss
+        + distill_lambda * distill_loss
+        + selective_lambda * selective_loss
+        + overlap_lambda * overlap_loss
+    )
+    return total_loss, recon_loss, sparse_loss, distill_loss, selective_loss, overlap_loss
 
 
 def local_train_sae(
@@ -63,6 +85,8 @@ def local_train_sae(
     lr=1e-3,
     l1_lambda=1e-4,
     selective_lambda=0.0,
+    overlap_lambda=0.0,
+    coupling_topm=5,
     use_layer_norm=True,
     client_id=None,
 ):
@@ -93,6 +117,7 @@ def local_train_sae(
         recon_loss_sum = 0.0
         sparse_loss_sum = 0.0
         selective_loss_sum = 0.0
+        overlap_loss_sum = 0.0
         total_num = 0
 
         batch_bar = tqdm(
@@ -104,6 +129,7 @@ def local_train_sae(
 
         for batch in batch_bar:
             images = batch["image"].float().to(device)
+            labels = batch["labels"].float().to(device)
             mask = batch["mask"].float().to(device)
 
             with torch.no_grad():
@@ -126,6 +152,7 @@ def local_train_sae(
 
             optimizer.zero_grad()
             x_hat, z = sae_model(feat)
+            z_all = z.reshape(label_emb.shape[0], label_emb.shape[1], -1)
             sae_total_loss, recon_loss, sparse_loss = sae_loss(
                 feat, x_hat, z, l1_lambda=l1_lambda
             )
@@ -134,7 +161,19 @@ def local_train_sae(
                 label_ids=label_ids,
                 num_labels=args.num_labels,
             )
-            loss = sae_total_loss + selective_lambda * selective_loss
+            coupled_ids, coupled_weights = get_batch_coupled_label_stats(
+                labels,
+                forget_cls=args.forget_cls,
+                top_m=coupling_topm,
+            )
+            overlap_loss = latent_coupling_overlap_loss(
+                z_all,
+                labels=labels,
+                forget_cls=args.forget_cls,
+                coupled_ids=coupled_ids,
+                coupled_weights=coupled_weights,
+            )
+            loss = sae_total_loss + selective_lambda * selective_loss + overlap_lambda * overlap_loss
             loss.backward()
             optimizer.step()
 
@@ -143,6 +182,7 @@ def local_train_sae(
             recon_loss_sum += recon_loss.item() * bs
             sparse_loss_sum += sparse_loss.item() * bs
             selective_loss_sum += selective_loss.item() * bs
+            overlap_loss_sum += overlap_loss.item() * bs
             total_num += bs
 
             batch_bar.set_postfix({
@@ -151,6 +191,7 @@ def local_train_sae(
                 "recon": f"{recon_loss.item():.5f}",
                 "sparse": f"{sparse_loss.item():.5f}",
                 "selective": f"{selective_loss.item():.5f}",
+                "overlap": f"{overlap_loss.item():.5f}",
             })
 
         epoch_log = {
@@ -158,6 +199,7 @@ def local_train_sae(
             "recon": recon_loss_sum / max(total_num, 1),
             "sparse": sparse_loss_sum / max(total_num, 1),
             "selective": selective_loss_sum / max(total_num, 1),
+            "overlap": overlap_loss_sum / max(total_num, 1),
         }
         epoch_logs.append(epoch_log)
 
@@ -166,6 +208,7 @@ def local_train_sae(
             "recon": f"{epoch_log['recon']:.5f}",
             "sparse": f"{epoch_log['sparse']:.5f}",
             "selective": f"{epoch_log['selective']:.5f}",
+            "overlap": f"{epoch_log['overlap']:.5f}",
         })
 
     return sae_model, epoch_logs
@@ -185,6 +228,8 @@ def local_train_sae_with_distill(
     l1_lambda=1e-4,
     distill_lambda=1.0,
     selective_lambda=0.0,
+    overlap_lambda=0.0,
+    coupling_topm=5,
     distill_type="cosine",
     use_layer_norm=True,
     client_id=None,
@@ -222,6 +267,7 @@ def local_train_sae_with_distill(
         sparse_loss_sum = 0.0
         distill_loss_sum = 0.0
         selective_loss_sum = 0.0
+        overlap_loss_sum = 0.0
         total_num = 0
 
         batch_bar = tqdm(
@@ -233,6 +279,7 @@ def local_train_sae_with_distill(
 
         for batch in batch_bar:
             images = batch["image"].float().to(device)
+            labels = batch["labels"].float().to(device)
             mask   = batch["mask"].float().to(device)
 
             # 1) 冻结主模型提 label_emb
@@ -265,9 +312,22 @@ def local_train_sae_with_distill(
             # 3) student SAE 前向
             optimizer.zero_grad()
             x_hat_student, z_student = student_sae(feat)
+            z_all = z_student.reshape(label_emb.shape[0], label_emb.shape[1], -1)
+            coupled_ids, coupled_weights = get_batch_coupled_label_stats(
+                labels,
+                forget_cls=args.forget_cls,
+                top_m=coupling_topm,
+            )
+            overlap_loss = latent_coupling_overlap_loss(
+                z_all,
+                labels=labels,
+                forget_cls=args.forget_cls,
+                coupled_ids=coupled_ids,
+                coupled_weights=coupled_weights,
+            )
 
             # 4) 蒸馏版 SAE loss
-            loss, recon_loss, sparse_loss, distill_loss, selective_loss = sae_distill_loss(
+            loss, recon_loss, sparse_loss, distill_loss, selective_loss, overlap_loss = sae_distill_loss(
                 feat,
                 x_hat_student,
                 z_student,
@@ -277,6 +337,8 @@ def local_train_sae_with_distill(
                 l1_lambda=l1_lambda,
                 distill_lambda=distill_lambda,
                 selective_lambda=selective_lambda,
+                overlap_loss=overlap_loss,
+                overlap_lambda=overlap_lambda,
                 distill_type=distill_type,
             )
 
@@ -289,6 +351,7 @@ def local_train_sae_with_distill(
             sparse_loss_sum += sparse_loss.item() * bs
             distill_loss_sum += distill_loss.item() * bs
             selective_loss_sum += selective_loss.item() * bs
+            overlap_loss_sum += overlap_loss.item() * bs
             total_num += bs
 
             batch_bar.set_postfix({
@@ -298,6 +361,7 @@ def local_train_sae_with_distill(
                 "sparse": f"{sparse_loss.item():.5f}",
                 "distill": f"{distill_loss.item():.5f}",
                 "selective": f"{selective_loss.item():.5f}",
+                "overlap": f"{overlap_loss.item():.5f}",
             })
 
         epoch_log = {
@@ -306,6 +370,7 @@ def local_train_sae_with_distill(
             "sparse": sparse_loss_sum / max(total_num, 1),
             "distill": distill_loss_sum / max(total_num, 1),
             "selective": selective_loss_sum / max(total_num, 1),
+            "overlap": overlap_loss_sum / max(total_num, 1),
         }
         epoch_logs.append(epoch_log)
 
@@ -315,6 +380,7 @@ def local_train_sae_with_distill(
             "sparse": f"{epoch_log['sparse']:.5f}",
             "distill": f"{epoch_log['distill']:.5f}",
             "selective": f"{epoch_log['selective']:.5f}",
+            "overlap": f"{epoch_log['overlap']:.5f}",
         })
 
     return student_sae, epoch_logs
@@ -363,6 +429,8 @@ def federated_train_sae(
     sae_lr=1e-3,
     l1_lambda=1e-4,
     selective_lambda=0.0,
+    overlap_lambda=0.0,
+    coupling_topm=5,
 ):
     """
     联邦普通 SAE 训练（无蒸馏）
@@ -419,6 +487,8 @@ def federated_train_sae(
                 lr=sae_lr,
                 l1_lambda=l1_lambda,
                 selective_lambda=selective_lambda,
+                overlap_lambda=overlap_lambda,
+                coupling_topm=coupling_topm,
                 use_layer_norm=True,
                 client_id=client_id,
             )
@@ -438,6 +508,7 @@ def federated_train_sae(
                 "total": f"{last_log['total']:.5f}",
                 "recon": f"{last_log['recon']:.5f}",
                 "selective": f"{last_log['selective']:.5f}",
+                "overlap": f"{last_log['overlap']:.5f}",
             })
 
             del local_sae
@@ -453,12 +524,14 @@ def federated_train_sae(
         mean_recon = np_mean([c["epoch_logs"][-1]["recon"] for c in client_logs])
         mean_sparse = np_mean([c["epoch_logs"][-1]["sparse"] for c in client_logs])
         mean_selective = np_mean([c["epoch_logs"][-1]["selective"] for c in client_logs])
+        mean_overlap = np_mean([c["epoch_logs"][-1]["overlap"] for c in client_logs])
 
         round_bar.set_postfix({
             "mean_total": f"{mean_total:.5f}",
             "mean_recon": f"{mean_recon:.5f}",
             "mean_sparse": f"{mean_sparse:.5f}",
             "mean_selective": f"{mean_selective:.5f}",
+            "mean_overlap": f"{mean_overlap:.5f}",
         })
 
         print(
@@ -466,7 +539,8 @@ def federated_train_sae(
             f"mean_total={mean_total:.6f} "
             f"mean_recon={mean_recon:.6f} "
             f"mean_sparse={mean_sparse:.6f} "
-            f"mean_selective={mean_selective:.6f}"
+            f"mean_selective={mean_selective:.6f} "
+            f"mean_overlap={mean_overlap:.6f}"
         )
 
         round_logs.append({
@@ -476,6 +550,7 @@ def federated_train_sae(
             "round_mean_recon": mean_recon,
             "round_mean_sparse": mean_sparse,
             "round_mean_selective": mean_selective,
+            "round_mean_overlap": mean_overlap,
         })
 
     return global_sae, round_logs
@@ -496,6 +571,8 @@ def federated_train_sae_with_distill(
     l1_lambda=1e-4,
     distill_lambda=1.0,
     selective_lambda=0.0,
+    overlap_lambda=0.0,
+    coupling_topm=5,
     distill_type="cosine",
 ):
     """
@@ -561,6 +638,8 @@ def federated_train_sae_with_distill(
                 l1_lambda=l1_lambda,
                 distill_lambda=distill_lambda,
                 selective_lambda=selective_lambda,
+                overlap_lambda=overlap_lambda,
+                coupling_topm=coupling_topm,
                 distill_type=distill_type,
                 use_layer_norm=True,
                 client_id=client_id,
@@ -581,6 +660,7 @@ def federated_train_sae_with_distill(
                 "total": f"{last_log['total']:.5f}",
                 "distill": f"{last_log['distill']:.5f}",
                 "selective": f"{last_log['selective']:.5f}",
+                "overlap": f"{last_log['overlap']:.5f}",
             })
 
             del teacher_sae
@@ -599,6 +679,7 @@ def federated_train_sae_with_distill(
         mean_sparse = np_mean([c["epoch_logs"][-1]["sparse"] for c in client_logs])
         mean_distill = np_mean([c["epoch_logs"][-1]["distill"] for c in client_logs])
         mean_selective = np_mean([c["epoch_logs"][-1]["selective"] for c in client_logs])
+        mean_overlap = np_mean([c["epoch_logs"][-1]["overlap"] for c in client_logs])
 
         round_bar.set_postfix({
             "mean_total": f"{mean_total:.5f}",
@@ -606,6 +687,7 @@ def federated_train_sae_with_distill(
             "mean_sparse": f"{mean_sparse:.5f}",
             "mean_distill": f"{mean_distill:.5f}",
             "mean_selective": f"{mean_selective:.5f}",
+            "mean_overlap": f"{mean_overlap:.5f}",
         })
 
         print(
@@ -614,7 +696,8 @@ def federated_train_sae_with_distill(
             f"mean_recon={mean_recon:.6f} "
             f"mean_sparse={mean_sparse:.6f} "
             f"mean_distill={mean_distill:.6f} "
-            f"mean_selective={mean_selective:.6f}"
+            f"mean_selective={mean_selective:.6f} "
+            f"mean_overlap={mean_overlap:.6f}"
         )
 
         round_logs.append({
@@ -625,6 +708,7 @@ def federated_train_sae_with_distill(
             "round_mean_sparse": mean_sparse,
             "round_mean_distill": mean_distill,
             "round_mean_selective": mean_selective,
+            "round_mean_overlap": mean_overlap,
         })
 
     return global_sae, round_logs

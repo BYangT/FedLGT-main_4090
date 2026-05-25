@@ -1062,6 +1062,8 @@ def collect_topk_dims_for_class(
     sae_model = _get_sae_model(args, device)
     latent_dim = sae_model.latent_dim
     beta_neg = 0.5   # 你可以后面再调
+    coupling_topm = getattr(args, "sae_coupling_topm", 5)
+    coupling_penalty_lambda = getattr(args, "topk_coupling_lambda", 0.5)
 
     # ===== 目标类正/负样本统计 =====
     pos_sum = torch.zeros(latent_dim, device=device)
@@ -1069,6 +1071,7 @@ def collect_topk_dims_for_class(
 
     neg_sum = torch.zeros(latent_dim, device=device)
     neg_cnt = 0
+    cooccur_counts = None
 
     # ===== 每个类单独统计正样本均值 =====
     num_labels = None
@@ -1094,6 +1097,7 @@ def collect_topk_dims_for_class(
 
     class_pos_sum = torch.zeros(num_labels, latent_dim, device=device)
     class_pos_cnt = torch.zeros(num_labels, device=device)
+    cooccur_counts = torch.zeros(num_labels, device=device)
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Collect top-K stats (SAE latent)"):
@@ -1126,6 +1130,7 @@ def collect_topk_dims_for_class(
                 z_pos = z_f[pos_idx]
                 pos_sum += z_pos.abs().sum(dim=0)
                 pos_cnt += z_pos.size(0)
+                cooccur_counts += labels[pos_idx].sum(dim=0)
 
             if neg_idx.any():
                 z_neg = z_f[neg_idx]
@@ -1145,6 +1150,7 @@ def collect_topk_dims_for_class(
     neg_mean = neg_sum / (neg_cnt + 1e-6)      # (latent_dim,)
 
     class_mean = class_pos_sum / (class_pos_cnt.unsqueeze(1) + 1e-6)   # (L, latent_dim)
+    cooccur_counts[forget_cls] = 0.0
 
     # ===== 最强竞争类 =====
     competitor_mean = class_mean.clone()
@@ -1163,6 +1169,18 @@ def collect_topk_dims_for_class(
         W_c_latent = torch.matmul(W_enc, W_c_raw)                     # (latent_dim,)
 
     score = base_score * W_c_latent.abs()
+
+    # ===== 高耦合类惩罚：从 top-K 打分里减去高耦合类响应 =====
+    coupled_mask = cooccur_counts > 0
+    coupled_penalty = torch.zeros(latent_dim, device=device)
+    top_coupled_cls = torch.empty(0, dtype=torch.long, device=device)
+    top_coupled_weights = torch.empty(0, device=device)
+    if coupled_mask.any():
+        top_m = min(int(coupling_topm), int(coupled_mask.sum().item()))
+        top_coupled_vals, top_coupled_cls = torch.topk(cooccur_counts, k=top_m, largest=True)
+        top_coupled_weights = top_coupled_vals / top_coupled_vals.sum().clamp_min(1e-6)
+        coupled_penalty = (class_mean[top_coupled_cls] * top_coupled_weights.unsqueeze(1)).sum(dim=0)
+        score = score - coupling_penalty_lambda * coupled_penalty * W_c_latent.abs()
 
     # ===== 公共特征过滤 =====
     pos_thr = pos_mean.mean() + 0.5 * pos_mean.std()
@@ -1202,6 +1220,11 @@ def collect_topk_dims_for_class(
     for cls_id, cnt in zip(top_related_cls.tolist(), top_related_vals.tolist()):
         if cnt > 0:
             print(f"  class {cls_id}: {cnt} times")
+
+    if top_coupled_cls.numel() > 0:
+        print(f"[forget_cls={forget_cls}] High-coupling classes used for score penalty:")
+        for cls_id, weight in zip(top_coupled_cls.tolist(), top_coupled_weights.tolist()):
+            print(f"  class {cls_id}: weight={weight:.4f}")
 
     return topk_idx, score
 
