@@ -1329,7 +1329,7 @@ def rerank_topk_dims_with_gradient(
         batch_seen += 1
 
     if sample_count == 0:
-        weight = torch.softmax(candidate_score[:min(final_k, M)], dim=0)
+        weight = torch.softmax(candidate_score[:min(final_k, M)], dim=0).detach()
         return candidate_idx[:min(final_k, M)], weight
 
     importance = importance_sum / float(sample_count)
@@ -1376,7 +1376,7 @@ def rerank_topk_dims_with_gradient(
         f"mean_importance={importance.mean().item():.4f}"
     )
 
-    return final_idx, final_weight
+    return final_idx.detach(), final_weight.detach()
 
 
 def unlearn_one_class_on_model_topk_logit(
@@ -1418,7 +1418,7 @@ def unlearn_one_class_on_model_topk_logit(
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
     if topk_weights is not None:
-        topk_weights = topk_weights.to(device).view(1, -1)
+        topk_weights = topk_weights.detach().to(device).view(1, -1)
 
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1543,7 +1543,7 @@ def unlearn_one_class_on_model(
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
     if topk_weights is not None:
-        topk_weights = topk_weights.to(device).view(1, -1)
+        topk_weights = topk_weights.detach().to(device).view(1, -1)
     print("【保护版】只更新 head(Person) + backbone.layer4")
 
     # ===== ① 先把所有参数默认冻结 =====
