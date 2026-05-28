@@ -1379,6 +1379,110 @@ def rerank_topk_dims_with_gradient(
     return final_idx.detach(), final_weight.detach()
 
 
+def estimate_target_subspace(
+    model,
+    dataloader,
+    forget_cls: int,
+    topk_idx: torch.Tensor,
+    device,
+    args,
+    emb_feat,
+    clip_model,
+    topk_weights: torch.Tensor = None,
+    max_batches: int = 3,
+    subspace_rank: int = 16,
+):
+    """
+    在少量目标类样本上估计 target-dominant latent subspace。
+    子空间定义在当前 top-K latent 上，供后续 forget loss 压制投影能量。
+    """
+    model.eval()
+    model.to(device)
+
+    sae_model = _get_sae_model(args, device)
+    sae_model.eval()
+
+    topk_idx = topk_idx.to(device)
+    if topk_weights is not None:
+        topk_weights = topk_weights.detach().to(device).view(1, -1)
+        metric_scale = topk_weights.sqrt()
+    else:
+        metric_scale = None
+
+    pos_chunks = []
+    neg_chunks = []
+    batch_seen = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            if batch_seen >= max_batches:
+                break
+
+            images = batch["image"].float().to(device)
+            labels = batch["labels"].float().to(device)
+            mask = batch["mask"].float().to(device)
+
+            pos_idx = labels[:, forget_cls] == 1
+            neg_idx = labels[:, forget_cls] == 0
+            if not pos_idx.any():
+                continue
+
+            _, _, _, label_emb = model(
+                images,
+                mask.clone(),
+                args.learn_emb_type,
+                emb_feat,
+                clip_model,
+                return_label_emb=True,
+            )
+
+            z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)
+            z_f = z_all[:, forget_cls, :]
+
+            z_pos = z_f[pos_idx][:, topk_idx]
+            if metric_scale is not None:
+                z_pos = z_pos * metric_scale
+            pos_chunks.append(z_pos)
+
+            if neg_idx.any():
+                z_neg = z_f[neg_idx][:, topk_idx]
+                if metric_scale is not None:
+                    z_neg = z_neg * metric_scale
+                neg_chunks.append(z_neg)
+
+            batch_seen += 1
+
+    if len(pos_chunks) == 0:
+        return None, None
+
+    z_pos_all = torch.cat(pos_chunks, dim=0)
+    if len(neg_chunks) > 0:
+        z_neg_all = torch.cat(neg_chunks, dim=0)
+        neg_center = z_neg_all.mean(dim=0, keepdim=True)
+        neg_count = z_neg_all.size(0)
+    else:
+        z_neg_all = None
+        neg_center = torch.zeros((1, z_pos_all.size(1)), device=device, dtype=z_pos_all.dtype)
+        neg_count = 0
+
+    z_target = z_pos_all - neg_center
+    rank_eff = max(1, min(int(subspace_rank), z_target.size(1), z_target.size(0)))
+
+    if z_target.size(0) == 1:
+        basis = F.normalize(z_target, dim=1).t()
+    else:
+        _, _, vh = torch.linalg.svd(z_target, full_matrices=False)
+        basis = vh[:rank_eff].t().contiguous()
+
+    print(
+        f"[Subspace] forget_cls={forget_cls}, pos_samples={z_pos_all.size(0)}, "
+        f"neg_samples={neg_count}, "
+        f"rank={basis.size(1)}"
+    )
+
+    return basis.detach(), neg_center.detach()
+
+
 def unlearn_one_class_on_model_topk_logit(
     model,
     dataloader,
@@ -1524,6 +1628,8 @@ def unlearn_one_class_on_model(
     lambda_forget_feat: float = 1.0,
     lr: float = 1e-4,
     topk_weights: torch.Tensor = None,
+    topk_subspace_basis: torch.Tensor = None,
+    topk_subspace_center: torch.Tensor = None,
 ):
     """
     方案二（保护版，SAE latent 版）：
@@ -1544,6 +1650,14 @@ def unlearn_one_class_on_model(
     D = topk_idx.numel()
     if topk_weights is not None:
         topk_weights = topk_weights.detach().to(device).view(1, -1)
+    hardneg_topn = max(1, int(getattr(args, "hardneg_topn", 3)))
+    shrink_w = float(getattr(args, "forget_shrink_weight", 0.3))
+    pull_w = float(getattr(args, "forget_pull_weight", 0.7))
+    subspace_w = float(getattr(args, "forget_subspace_weight", 0.4))
+    if topk_subspace_basis is not None:
+        topk_subspace_basis = topk_subspace_basis.detach().to(device)
+    if topk_subspace_center is not None:
+        topk_subspace_center = topk_subspace_center.detach().to(device)
     print("【保护版】只更新 head(Person) + backbone.layer4")
 
     # ===== ① 先把所有参数默认冻结 =====
@@ -1657,16 +1771,38 @@ def unlearn_one_class_on_model(
                 z_pos_topk = z_pos[:, topk_idx]
                 z_neg_topk = z_neg[:, topk_idx]
 
-                mu_neg_topk = z_neg_topk.mean(dim=0, keepdim=True)
-
                 if topk_weights is None:
                     loss_shrink = (z_pos_topk ** 2).mean()
-                    loss_pull_neg = ((z_pos_topk - mu_neg_topk) ** 2).mean()
+                    z_pos_metric = z_pos_topk
+                    z_neg_metric = z_neg_topk
                 else:
                     loss_shrink = ((z_pos_topk ** 2) * topk_weights).sum(dim=1).mean()
-                    loss_pull_neg = (((z_pos_topk - mu_neg_topk) ** 2) * topk_weights).sum(dim=1).mean()
+                    metric_scale = topk_weights.sqrt()
+                    z_pos_metric = z_pos_topk * metric_scale
+                    z_neg_metric = z_neg_topk * metric_scale
 
-                loss_forget_feat = 0.8 * loss_shrink + 0.2 * loss_pull_neg
+                # 对每个正样本，只拉向 batch 内最接近的几个负样本，而不是负样本均值。
+                dist_mat = torch.cdist(z_pos_metric, z_neg_metric, p=2) ** 2   # (N_pos, N_neg)
+                topn = min(hardneg_topn, dist_mat.size(1))
+                hardneg_dist = torch.topk(dist_mat, k=topn, largest=False, dim=1).values
+                loss_pull_neg = hardneg_dist.mean()
+
+                if topk_subspace_basis is not None:
+                    if topk_subspace_center is None:
+                        z_centered = z_pos_metric
+                    else:
+                        z_centered = z_pos_metric - topk_subspace_center
+                    proj = z_centered @ topk_subspace_basis
+                    loss_subspace = (proj ** 2).sum(dim=1).mean()
+                else:
+                    loss_subspace = torch.tensor(0.0, device=device)
+
+                norm = max(shrink_w + pull_w + subspace_w, 1e-6)
+                loss_forget_feat = (
+                    (shrink_w / norm) * loss_shrink +
+                    (pull_w / norm) * loss_pull_neg +
+                    (subspace_w / norm) * loss_subspace
+                )
             else:
                 loss_forget_feat = torch.tensor(0.0, device=device)
 

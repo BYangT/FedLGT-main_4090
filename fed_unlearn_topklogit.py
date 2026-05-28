@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from ulearn.unlearn_utils_topklogit import (
     collect_topk_dims_for_class,
+    estimate_target_subspace,
     rerank_topk_dims_with_gradient,
     unlearn_one_class_on_model,
 )
@@ -199,6 +200,26 @@ def federated_unlearn_one_class_topklogit(
 
     print(f"[TopK+Logit-Fed] Global reranked top-{K_eff} dims calculated from candidate_M={candidate_M}.")
 
+    subspace_batches = max(1, int(getattr(args, "subspace_batches", rerank_batch_n)))
+    subspace_rank = max(1, int(getattr(args, "subspace_rank", min(16, K_eff))))
+    global_model.load_state_dict(global_state_dict)
+    topk_subspace_basis, topk_subspace_center = estimate_target_subspace(
+        model=global_model,
+        dataloader=rerank_loader,
+        forget_cls=forget_cls,
+        topk_idx=topk_idx_global,
+        topk_weights=topk_weight_global,
+        device=device,
+        args=args,
+        emb_feat=emb_feat,
+        clip_model=clip_model,
+        max_batches=subspace_batches,
+        subspace_rank=subspace_rank,
+    )
+    global_model.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+
     # ========= 2) 多轮联邦遗忘 =========
     for ur in range(unlearn_rounds):
         print(f"\n[TopK+Logit-Fed][Unlearn-Round {ur}] Start ...")
@@ -258,6 +279,8 @@ def federated_unlearn_one_class_topklogit(
                     forget_cls=forget_cls,
                     topk_idx=topk_idx_global,
                     topk_weights=topk_weight_global,
+                    topk_subspace_basis=topk_subspace_basis,
+                    topk_subspace_center=topk_subspace_center,
                     device=device,
                     args=args,
                     emb_feat=emb_feat,

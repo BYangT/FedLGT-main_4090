@@ -75,6 +75,42 @@ def get_args(parser,eval=False):
         help='redundancy penalty weight in top-K reranking'
     )
     parser.add_argument(
+        '--hardneg_topn',
+        type=int,
+        default=3,
+        help='number of nearest negative samples used in hard-negative latent forgetting'
+    )
+    parser.add_argument(
+        '--forget_shrink_weight',
+        type=float,
+        default=0.3,
+        help='weight of latent shrink term in forget loss'
+    )
+    parser.add_argument(
+        '--forget_pull_weight',
+        type=float,
+        default=0.7,
+        help='weight of hard-negative pull term in forget loss'
+    )
+    parser.add_argument(
+        '--subspace_rank',
+        type=int,
+        default=16,
+        help='rank of target-dominant latent subspace estimated for forgetting'
+    )
+    parser.add_argument(
+        '--subspace_batches',
+        type=int,
+        default=3,
+        help='number of small batches used to estimate target latent subspace'
+    )
+    parser.add_argument(
+        '--forget_subspace_weight',
+        type=float,
+        default=0.4,
+        help='weight of target-subspace projection term in forget loss'
+    )
+    parser.add_argument(
         '--disable_sae_distill',
         action='store_true',
         help='skip federated SAE distillation and use warmup SAE directly for unlearning'
