@@ -73,6 +73,105 @@ class CTranModel(nn.Module):
         self.use_ml_head = False
         self.decoder = MLDecoder(num_classes=num_labels, decoder_embedding=512, initial_num_features=512)
 
+        # One-shot target-subspace nulling (runtime-only)
+        self._forget_proj_enabled = False
+        self._forget_proj_forget_cls = None
+        self._forget_proj_sae = None
+        self._forget_proj_topk_idx = None
+        self._forget_proj_basis = None
+        self._forget_proj_center = None
+        self._forget_proj_weights = None
+        self._forget_proj_alpha = 1.0
+        self._forget_proj_use_layer_norm = True
+        self._forget_proj_bias_shift = 0.0
+
+    def clear_forget_projection(self):
+        self._forget_proj_enabled = False
+        self._forget_proj_forget_cls = None
+        self._forget_proj_sae = None
+        self._forget_proj_topk_idx = None
+        self._forget_proj_basis = None
+        self._forget_proj_center = None
+        self._forget_proj_weights = None
+        self._forget_proj_alpha = 1.0
+        self._forget_proj_use_layer_norm = True
+        self._forget_proj_bias_shift = 0.0
+
+    def set_forget_projection(
+        self,
+        forget_cls,
+        sae_model,
+        topk_idx,
+        basis,
+        center=None,
+        weights=None,
+        alpha=1.0,
+        use_layer_norm=True,
+        bias_shift=0.0,
+    ):
+        self._forget_proj_enabled = True
+        self._forget_proj_forget_cls = int(forget_cls)
+        self._forget_proj_sae = sae_model
+        self._forget_proj_topk_idx = topk_idx.detach().clone()
+        self._forget_proj_basis = basis.detach().clone()
+        self._forget_proj_center = None if center is None else center.detach().clone()
+        self._forget_proj_weights = None if weights is None else weights.detach().clone()
+        self._forget_proj_alpha = float(alpha)
+        self._forget_proj_use_layer_norm = bool(use_layer_norm)
+        self._forget_proj_bias_shift = float(bias_shift)
+
+    def _apply_forget_projection(self, label_embeddings):
+        if not self._forget_proj_enabled:
+            return label_embeddings
+        if self._forget_proj_sae is None or self._forget_proj_basis is None or self._forget_proj_topk_idx is None:
+            return label_embeddings
+
+        forget_cls = self._forget_proj_forget_cls
+        if forget_cls is None or forget_cls < 0 or forget_cls >= label_embeddings.size(1):
+            return label_embeddings
+
+        sae_model = self._forget_proj_sae.to(label_embeddings.device)
+        sae_model.eval()
+
+        x = label_embeddings[:, forget_cls, :]
+        x_in = F.layer_norm(x, x.shape[-1:]) if self._forget_proj_use_layer_norm else x
+        z = sae_model.encode(x_in)
+
+        topk_idx = self._forget_proj_topk_idx.to(label_embeddings.device).long()
+        z_topk = z[:, topk_idx]
+
+        if self._forget_proj_weights is not None:
+            metric_scale = self._forget_proj_weights.to(label_embeddings.device).view(1, -1).sqrt().clamp_min(1e-6)
+            z_metric = z_topk * metric_scale
+        else:
+            metric_scale = None
+            z_metric = z_topk
+
+        basis = self._forget_proj_basis.to(label_embeddings.device)
+        center = (
+            self._forget_proj_center.to(label_embeddings.device)
+            if self._forget_proj_center is not None
+            else torch.zeros((1, z_metric.size(1)), device=label_embeddings.device, dtype=label_embeddings.dtype)
+        )
+
+        centered = z_metric - center
+        coeff = centered @ basis
+        proj = coeff @ basis.transpose(0, 1)
+        z_metric_new = centered - self._forget_proj_alpha * proj + center
+
+        if metric_scale is not None:
+            z_topk_new = z_metric_new / metric_scale
+        else:
+            z_topk_new = z_metric_new
+
+        z_new = z.clone()
+        z_new[:, topk_idx] = z_topk_new
+        x_hat = sae_model.decode(z_new)
+
+        label_embeddings = label_embeddings.clone()
+        label_embeddings[:, forget_cls, :] = x_hat
+        return label_embeddings
+
 
     def forward(self, images, mask, label_emb_type='ctran', clip_emb=None, clip_model=None, return_label_emb: bool = False):
 
@@ -136,6 +235,8 @@ class CTranModel(nn.Module):
         # (1, 17, 512)
         # 标签tokens
         label_embeddings = embeddings[:,-init_label_embeddings.size(1):,:]
+        if self._forget_proj_enabled:
+            label_embeddings = self._apply_forget_projection(label_embeddings)
         # 视觉tokens(B, 49, 512)
         # tmp_emb = embeddings[:,init_label_embeddings.size(1):,:]
         tmp_emb = embeddings[:, :embeddings.size(1) - init_label_embeddings.size(1):, :]
@@ -155,8 +256,9 @@ class CTranModel(nn.Module):
             output = self.output_linear(label_embeddings)
             diag_mask = torch.eye(output.size(1)).unsqueeze(0).repeat(output.size(0),1,1).cuda()
             output = (output*diag_mask).sum(-1)
+            if self._forget_proj_enabled and abs(self._forget_proj_bias_shift) > 0:
+                output[:, self._forget_proj_forget_cls] = output[:, self._forget_proj_forget_cls] - self._forget_proj_bias_shift
         if return_label_emb:
             return output, None, attns, label_embeddings
         else:
             return output, None, attns
-

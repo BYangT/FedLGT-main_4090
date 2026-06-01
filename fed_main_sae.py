@@ -23,7 +23,10 @@ import re
 
 from scipy.special import softmax
 
-from fed_unlearn_topklogit import federated_unlearn_one_class_topklogit
+from fed_unlearn_topklogit import (
+    federated_oneshot_unlearn_one_class_subspace,
+    federated_unlearn_one_class_topklogit,
+)
 from ulearn.per_class_report import save_voc_per_class_report_csv
 from ulearn.recovery_train_simple import federated_recovery_simple
 from ulearn.sae import SparseAutoEncoder
@@ -675,29 +678,44 @@ if __name__ == '__main__':
         print(f"CF1(before):   {test_metrics_before['CF1']:.3f}")
         print(f"OF1(before):   {test_metrics_before['OF1']:.3f}")
 
-        print(f"==== Start FULL federated unlearning for class {forget_cls} (top-{K}) ====")
-
-        global_model = federated_unlearn_one_class_topklogit(
-            args=args,
-            global_model=global_model,
-            nets=nets,
-            train_dl_global=train_dl_global,
-            partition_idx_map=partition_idx_map,
-            device=device,
-            emb_feat=label_text_features,
-            clip_model=clip_model,
-            forget_cls=forget_cls,
-            K=K,
-            unlearn_rounds=3,
-            client_frac=1.0,
-            unlearn_epochs=4,
-            unlearn_lr=1e-4,
-            lambda_keep=2.0,
-            lambda_forget_logit=0.0,
-            lambda_forget_feat=4.0,
-            min_pos=10,
-            mode="feat_only",
-        )
+        if args.oneshot_subspace_nulling:
+            print(f"==== Start ONE-SHOT subspace nulling for class {forget_cls} (top-{K}) ====")
+            global_model = federated_oneshot_unlearn_one_class_subspace(
+                args=args,
+                global_model=global_model,
+                nets=nets,
+                train_dl_global=train_dl_global,
+                partition_idx_map=partition_idx_map,
+                device=device,
+                emb_feat=label_text_features,
+                clip_model=clip_model,
+                forget_cls=forget_cls,
+                K=K,
+                min_pos=10,
+            )
+        else:
+            print(f"==== Start FULL federated unlearning for class {forget_cls} (top-{K}) ====")
+            global_model = federated_unlearn_one_class_topklogit(
+                args=args,
+                global_model=global_model,
+                nets=nets,
+                train_dl_global=train_dl_global,
+                partition_idx_map=partition_idx_map,
+                device=device,
+                emb_feat=label_text_features,
+                clip_model=clip_model,
+                forget_cls=forget_cls,
+                K=K,
+                unlearn_rounds=3,
+                client_frac=1.0,
+                unlearn_epochs=4,
+                unlearn_lr=1e-4,
+                lambda_keep=2.0,
+                lambda_forget_logit=0.0,
+                lambda_forget_feat=4.0,
+                min_pos=10,
+                mode="feat_only",
+            )
 
         print("==== Evaluate global model AFTER unlearning ====")
         all_preds_after, all_targs_after, all_masks_a, all_ids_a, test_loss_a, test_loss_unk_a = run_epoch(
@@ -752,41 +770,51 @@ if __name__ == '__main__':
         print("非目标类均值 before:", summary["others_mean_before"])
         print("非目标类均值 after :", summary["others_mean_after"])
 
-        global_model = federated_recovery_simple(
-            args=args,
-            global_model=global_model,
-            nets=nets,
-            train_dl_global=train_dl_global,
-            partition_idx_map=partition_idx_map,
-            device=device,
-            emb_feat=label_text_features,
-            clip_model=clip_model,
-            forget_cls=forget_cls,
-            recovery_rounds=2,
-        )
+        if args.oneshot_subspace_nulling:
+            print("==== Skip recovery for ONE-SHOT subspace nulling ====")
+            all_preds_rec, all_targs_rec, all_masks_rec, all_ids_rec = all_preds_after, all_targs_after, all_masks_a, all_ids_a
+            test_loss_rec, test_loss_unk_rec = test_loss_a, test_loss_unk_a
+            test_metrics_rec = test_metrics_after
+            print(f"mAP(after_recovery):   {test_metrics_rec['mAP']:.3f}")
+            print(f"O_mAP(after_recovery): {test_metrics_rec['O_mAP']:.3f}")
+            print(f"CF1(after_recovery):   {test_metrics_rec['CF1']:.3f}")
+            print(f"OF1(after_recovery):   {test_metrics_rec['OF1']:.3f}")
+        else:
+            global_model = federated_recovery_simple(
+                args=args,
+                global_model=global_model,
+                nets=nets,
+                train_dl_global=train_dl_global,
+                partition_idx_map=partition_idx_map,
+                device=device,
+                emb_feat=label_text_features,
+                clip_model=clip_model,
+                forget_cls=forget_cls,
+                recovery_rounds=2,
+            )
 
-        print("==== Evaluate global model AFTER RECOVERY ====")
-        all_preds_rec, all_targs_rec, all_masks_rec, all_ids_rec, test_loss_rec, test_loss_unk_rec = run_epoch(
-            args,
-            global_model,
-            test_dl_global,
-            None,
-            1,
-            'Testing-After-Recovery',
-            global_model=global_model,
-            emb_feat=label_text_features,
-            clip_model=clip_model
-        )
-        test_metrics_rec = evaluate.compute_metrics(
-            args,
-            all_preds_rec, all_targs_rec, all_masks_rec,
-            test_loss_rec, test_loss_unk_rec,
-            0, 1
-        )
-        print(f"mAP(after_recovery):   {test_metrics_rec['mAP']:.3f}")
-        print(f"O_mAP(after_recovery): {test_metrics_rec['O_mAP']:.3f}")
-        print(f"CF1(after_recovery):   {test_metrics_rec['CF1']:.3f}")
-        print(f"OF1(after_recovery):   {test_metrics_rec['OF1']:.3f}")
+            print("==== Evaluate global model AFTER RECOVERY ====")
+            all_preds_rec, all_targs_rec, all_masks_rec, all_ids_rec, test_loss_rec, test_loss_unk_rec = run_epoch(
+                args,
+                global_model,
+                test_dl_global,
+                None,
+                1,
+                'Testing-After-Recovery',
+                global_model=global_model,
+                emb_feat=label_text_features,
+                clip_model=clip_model
+            )
+            test_metrics_rec = evaluate.compute_metrics(
+                args,
+                all_preds_rec, all_targs_rec, all_masks_rec,
+                test_loss_rec, test_loss_unk_rec,
+                0, 1
+            )
+            print(f"mAP(after_recovery):   {test_metrics_rec['mAP']:.3f}")
+            print(f"O_mAP(after_recovery): {test_metrics_rec['O_mAP']:.3f}")
+            print(f"CF1(after_recovery):   {test_metrics_rec['CF1']:.3f}")
+            print(f"OF1(after_recovery):   {test_metrics_rec['OF1']:.3f}")
 
         csv_path_recovery = os.path.join(
             args.results_new,

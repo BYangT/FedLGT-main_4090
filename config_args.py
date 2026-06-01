@@ -111,6 +111,23 @@ def get_args(parser,eval=False):
         help='weight of target-subspace projection term in forget loss'
     )
     parser.add_argument(
+        '--oneshot_subspace_nulling',
+        action='store_true',
+        help='use one-shot target-subspace nulling instead of iterative federated unlearning'
+    )
+    parser.add_argument(
+        '--oneshot_subspace_alpha',
+        type=float,
+        default=1.0,
+        help='strength of one-shot target-subspace projection removal'
+    )
+    parser.add_argument(
+        '--oneshot_bias_shift',
+        type=float,
+        default=0.0,
+        help='optional extra bias shift on forget class logit during one-shot nulling'
+    )
+    parser.add_argument(
         '--disable_sae_distill',
         action='store_true',
         help='skip federated SAE distillation and use warmup SAE directly for unlearning'
