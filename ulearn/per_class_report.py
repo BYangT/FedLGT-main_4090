@@ -17,6 +17,12 @@ def _to_numpy(x):
     else:
         return np.asarray(x)
 
+
+def _sanitize_logits_tensor(x: torch.Tensor) -> torch.Tensor:
+    if not torch.isfinite(x).all():
+        print("[per_class_report] Warning: non-finite logits detected, applying nan_to_num before reporting.")
+    return torch.nan_to_num(x, nan=0.0, posinf=30.0, neginf=-30.0)
+
 def _per_class_stats(y_true, y_logits, thr=0.5, eps=1e-8):
     """
     y_true:  (N, L) 0/1
@@ -97,8 +103,8 @@ def save_voc_per_class_report_csv(
     """
 
     # ---- 转成 numpy ----
-    logits_b = all_preds_before.detach().cpu()
-    logits_a = all_preds_after.detach().cpu()
+    logits_b = _sanitize_logits_tensor(all_preds_before.detach().cpu())
+    logits_a = _sanitize_logits_tensor(all_preds_after.detach().cpu())
     targs_b = all_targs_before.detach().cpu()
     targs_a = all_targs_after.detach().cpu()
 

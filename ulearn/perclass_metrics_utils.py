@@ -6,6 +6,12 @@ import numpy as np
 from sklearn.metrics import average_precision_score, precision_recall_fscore_support
 
 
+def _sanitize_logits_tensor(x: torch.Tensor) -> torch.Tensor:
+    if not torch.isfinite(x).all():
+        print("[perclass_metrics_utils] Warning: non-finite logits detected, applying nan_to_num before metrics.")
+    return torch.nan_to_num(x, nan=0.0, posinf=30.0, neginf=-30.0)
+
+
 def compute_per_class_metrics(all_preds_tensor, all_targs_tensor, threshold=0.5):
     """
     根据 logits + targets，计算每个类别的 AP / P / R / F1
@@ -25,7 +31,7 @@ def compute_per_class_metrics(all_preds_tensor, all_targs_tensor, threshold=0.5)
             }
     """
     # logits -> 概率
-    probs = torch.sigmoid(all_preds_tensor).detach().cpu().numpy()   # (N, L)
+    probs = torch.sigmoid(_sanitize_logits_tensor(all_preds_tensor)).detach().cpu().numpy()   # (N, L)
     targets = all_targs_tensor.detach().cpu().numpy()                # (N, L)
 
     num_labels = probs.shape[1]
@@ -83,7 +89,7 @@ def compute_hamming_and_subset_accuracy(
           }
     """
     # 先复制到同设备
-    preds = all_preds_tensor.detach()
+    preds = _sanitize_logits_tensor(all_preds_tensor.detach())
     targs = all_targs_tensor.detach()
 
     # 按样本子集筛选

@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from ulearn.unlearn_utils_topklogit import (
+    _get_analysis_dim,
     aggregate_target_subspace_from_stats,
     aggregate_rerank_from_client_stats,
     aggregate_topk_score_from_client_stats,
@@ -95,55 +96,6 @@ def federated_oneshot_unlearn_one_class_subspace(
     global_model.cpu()
     global_state_dict = copy.deepcopy(global_model.state_dict())
 
-    print(f"[OneShot-Subspace] Collect client-wise top-K statistics ...")
-    topk_client_stats = []
-    for cid in candidate_clients:
-        sub_dst = Subset(train_dl_global.dataset, partition_idx_map[cid])
-        loader = DataLoader(
-            sub_dst,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            drop_last=False,
-        )
-
-        local_model = nets[cid]
-        local_model.load_state_dict(global_state_dict)
-        local_model.to(device)
-
-        stats_local = collect_client_topk_stats(
-            model=local_model,
-            dataloader=loader,
-            forget_cls=forget_cls,
-            device=device,
-            args=args,
-            emb_feat=emb_feat,
-            clip_model=clip_model,
-        )
-        topk_client_stats.append(stats_local)
-
-        local_model.cpu()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    global_model.load_state_dict(global_state_dict)
-    global_model.to(device)
-    global_score = aggregate_topk_score_from_client_stats(
-        client_stats=topk_client_stats,
-        model=global_model,
-        forget_cls=forget_cls,
-        device=device,
-        args=args,
-    )
-    global_model.cpu()
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    K_eff = min(K, global_score.numel())
-    candidate_mul = max(1.0, float(getattr(args, "topk_candidate_mul", 2.0)))
-    candidate_M = min(global_score.numel(), max(K_eff, int(round(K_eff * candidate_mul))))
-    candidate_val, candidate_idx = torch.topk(global_score, k=candidate_M)
-
     rerank_client_n = max(1, int(getattr(args, "topk_rerank_clients", 2)))
     rerank_batch_n = max(1, int(getattr(args, "topk_rerank_batches", 3)))
     rerank_alpha = float(getattr(args, "topk_rerank_alpha", 0.5))
@@ -151,48 +103,115 @@ def federated_oneshot_unlearn_one_class_subspace(
     rerank_gamma = float(getattr(args, "topk_rerank_gamma", 0.2))
 
     rerank_clients = sorted(candidate_clients, key=lambda cid: client_pos_count[cid], reverse=True)[:rerank_client_n]
-    rerank_client_stats = []
-    for cid in rerank_clients:
-        sub_dst = Subset(train_dl_global.dataset, partition_idx_map[cid])
-        loader = DataLoader(
-            sub_dst,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            drop_last=False,
+    global_model.load_state_dict(global_state_dict)
+    global_model.to(device)
+    sae_model = _get_sae_model(args, device)
+    analysis_dim = _get_analysis_dim(global_model, sae_model)
+    global_model.cpu()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    K_eff = min(K, analysis_dim)
+    full_space_mode = K_eff >= analysis_dim
+
+    if full_space_mode:
+        print(
+            f"[OneShot-Subspace] K={K} reaches full analysis space ({analysis_dim}); "
+            f"skip top-K scoring and rerank."
         )
+        topk_idx_global = torch.arange(analysis_dim, dtype=torch.long)
+        topk_weight_global = None
+    else:
+        print(f"[OneShot-Subspace] Collect client-wise top-K statistics ...")
+        topk_client_stats = []
+        for cid in candidate_clients:
+            sub_dst = Subset(train_dl_global.dataset, partition_idx_map[cid])
+            loader = DataLoader(
+                sub_dst,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.workers,
+                drop_last=False,
+            )
 
-        local_model = nets[cid]
-        local_model.load_state_dict(global_state_dict)
-        local_model.to(device)
+            local_model = nets[cid]
+            local_model.load_state_dict(global_state_dict)
+            local_model.to(device)
 
-        stats_local = collect_client_rerank_stats(
-            model=local_model,
-            dataloader=loader,
+            stats_local = collect_client_topk_stats(
+                model=local_model,
+                dataloader=loader,
+                forget_cls=forget_cls,
+                device=device,
+                args=args,
+                emb_feat=emb_feat,
+                clip_model=clip_model,
+            )
+            topk_client_stats.append(stats_local)
+
+            local_model.cpu()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        global_model.load_state_dict(global_state_dict)
+        global_model.to(device)
+        global_score = aggregate_topk_score_from_client_stats(
+            client_stats=topk_client_stats,
+            model=global_model,
             forget_cls=forget_cls,
-            candidate_idx=candidate_idx,
             device=device,
             args=args,
-            emb_feat=emb_feat,
-            clip_model=clip_model,
-            max_batches=rerank_batch_n,
         )
-        rerank_client_stats.append(stats_local)
-
-        local_model.cpu()
+        global_model.cpu()
         torch.cuda.empty_cache()
         gc.collect()
 
-    topk_idx_global, topk_weight_global = aggregate_rerank_from_client_stats(
-        client_stats=rerank_client_stats,
-        candidate_idx=candidate_idx,
-        candidate_score=candidate_val,
-        final_k=K_eff,
-        device=device,
-        alpha=rerank_alpha,
-        beta=rerank_beta,
-        gamma=rerank_gamma,
-    )
+        candidate_mul = max(1.0, float(getattr(args, "topk_candidate_mul", 2.0)))
+        candidate_M = min(global_score.numel(), max(K_eff, int(round(K_eff * candidate_mul))))
+        candidate_val, candidate_idx = torch.topk(global_score, k=candidate_M)
+
+        rerank_client_stats = []
+        for cid in rerank_clients:
+            sub_dst = Subset(train_dl_global.dataset, partition_idx_map[cid])
+            loader = DataLoader(
+                sub_dst,
+                batch_size=args.batch_size,
+                shuffle=False,
+                num_workers=args.workers,
+                drop_last=False,
+            )
+
+            local_model = nets[cid]
+            local_model.load_state_dict(global_state_dict)
+            local_model.to(device)
+
+            stats_local = collect_client_rerank_stats(
+                model=local_model,
+                dataloader=loader,
+                forget_cls=forget_cls,
+                candidate_idx=candidate_idx,
+                device=device,
+                args=args,
+                emb_feat=emb_feat,
+                clip_model=clip_model,
+                max_batches=rerank_batch_n,
+            )
+            rerank_client_stats.append(stats_local)
+
+            local_model.cpu()
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        topk_idx_global, topk_weight_global = aggregate_rerank_from_client_stats(
+            client_stats=rerank_client_stats,
+            candidate_idx=candidate_idx,
+            candidate_score=candidate_val,
+            final_k=K_eff,
+            device=device,
+            alpha=rerank_alpha,
+            beta=rerank_beta,
+            gamma=rerank_gamma,
+        )
 
     subspace_batches = max(1, int(getattr(args, "subspace_batches", rerank_batch_n)))
     subspace_rank = max(1, int(getattr(args, "subspace_rank", min(16, K_eff))))
@@ -203,7 +222,7 @@ def federated_oneshot_unlearn_one_class_subspace(
         nets=nets,
         train_dl_global=train_dl_global,
         partition_idx_map=partition_idx_map,
-        candidate_clients=rerank_clients,
+        candidate_clients=candidate_clients,
         client_pos_count=client_pos_count,
         forget_cls=forget_cls,
         topk_idx_global=topk_idx_global,

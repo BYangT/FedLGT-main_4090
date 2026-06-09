@@ -2,7 +2,6 @@ import torch
 import argparse
 import numpy as np
 
-from fed_unlearn_vis_projector import federated_unlearn_one_class_vis_projector
 from load_data import get_data
 from models import CTranModel
 from config_args import get_args
@@ -28,9 +27,9 @@ from fed_unlearn_topklogit import (
     federated_unlearn_one_class_topklogit,
 )
 from ulearn.per_class_report import save_voc_per_class_report_csv
-from ulearn.recovery_train_simple import federated_recovery_simple
+from ulearn.recovery_train import federated_recovery_no_target_samples
 from ulearn.sae import SparseAutoEncoder
-from ulearn.fed_sae_distill import federated_train_sae, federated_train_sae_with_distill
+from ulearn.fed_sae_distill import federated_train_sae
 
 
 def init_nets(args, is_global=False, state_weight=None, label_weight=None):
@@ -489,127 +488,83 @@ if __name__ == '__main__':
         net.to('cpu')
     torch.cuda.empty_cache()
 
-    # ====== 训练 SAE（供 latent Top-K 使用） ======
-    print("==== Start federated SAE warmup + distillation ====")
-
     sae_input_dim = 512
     sae_latent_dim = 1024
     sae_activation = "relu"
     sae_l1_lambda = 1e-4
     sae_warmup_rounds = getattr(args, "sae_warmup_rounds", 3)
     sae_warmup_local_epochs = getattr(args, "sae_warmup_local_epochs", args.epochs)
-    sae_rounds = getattr(args, "sae_rounds", 3)
-    sae_local_epochs = getattr(args, "sae_local_epochs", args.epochs)
     sae_lr = getattr(args, "sae_lr", 1e-3)
-    sae_distill_lambda = getattr(args, "sae_distill_lambda", 1.0)
-    sae_distill_type = getattr(args, "sae_distill_type", "cosine")
     sae_selective_lambda = getattr(args, "sae_selective_lambda", 0.05)
     sae_overlap_lambda = getattr(args, "sae_overlap_lambda", 0.1)
     sae_coupling_topm = getattr(args, "sae_coupling_topm", 5)
     topk_coupling_lambda = getattr(args, "topk_coupling_lambda", 0.5)
-    use_sae_distill = not getattr(args, "disable_sae_distill", False)
+    use_sae = bool(getattr(args, "use_sae", True))
+    args.use_sae = use_sae
 
-    selective_tag = re.sub(
-        r"[^0-9a-zA-Z]+",
-        "p",
-        f"sel{sae_selective_lambda:g}_ov{sae_overlap_lambda:g}_ct{sae_coupling_topm}_tk{topk_coupling_lambda:g}",
-    )
-    sae_warmup_path = os.path.join("ulearn", f"sae_512_to_1024_{selective_tag}.pth")
-    sae_distill_path = os.path.join("ulearn_model", f"fed_sae_distill_{selective_tag}.pth")
-    sae_warmup_log_path = os.path.join(args.results_new, f"fed_sae_warmup_round_logs_{selective_tag}.json")
-    sae_round_log_path = os.path.join(args.results_new, f"fed_sae_distill_round_logs_{selective_tag}.json")
-
-    if not os.path.exists(sae_warmup_path):
+    if use_sae:
         print("==== Start federated SAE warmup ====")
-        global_sae = SparseAutoEncoder(
-            input_dim=sae_input_dim,
-            latent_dim=sae_latent_dim,
-            activation=sae_activation,
+        selective_tag = re.sub(
+            r"[^0-9a-zA-Z]+",
+            "p",
+            f"sel{sae_selective_lambda:g}_ov{sae_overlap_lambda:g}_ct{sae_coupling_topm}_tk{topk_coupling_lambda:g}",
         )
+        sae_warmup_path = os.path.join("ulearn", f"sae_512_to_1024_{selective_tag}.pth")
+        sae_warmup_log_path = os.path.join(args.results_new, f"fed_sae_warmup_round_logs_{selective_tag}.json")
 
-        global_sae, sae_warmup_logs = federated_train_sae(
-            args=args,
-            global_model=global_model,
-            global_sae=global_sae,
-            train_dl_global=train_dl_global,
-            partition_idx_map=partition_idx_map,
-            device=device,
-            emb_feat=label_text_features,
-            clip_model=clip_model,
-            sae_rounds=sae_warmup_rounds,
-            sae_local_epochs=sae_warmup_local_epochs,
-            sae_lr=sae_lr,
-            l1_lambda=sae_l1_lambda,
-            selective_lambda=sae_selective_lambda,
-            overlap_lambda=sae_overlap_lambda,
-            coupling_topm=sae_coupling_topm,
-        )
-        os.makedirs(os.path.dirname(sae_warmup_path), exist_ok=True)
-        os.makedirs(args.results_new, exist_ok=True)
-        torch.save(global_sae.cpu().state_dict(), sae_warmup_path)
-        with open(sae_warmup_log_path, "w") as f:
-            json.dump(sae_warmup_logs, f, indent=2)
+        if not os.path.exists(sae_warmup_path):
+            print("==== Start federated SAE warmup ====")
+            global_sae = SparseAutoEncoder(
+                input_dim=sae_input_dim,
+                latent_dim=sae_latent_dim,
+                activation=sae_activation,
+            )
 
-        print(f"Federated SAE warmup saved to: {sae_warmup_path}")
-        print(f"SAE warmup round logs saved to: {sae_warmup_log_path}")
+            global_sae, sae_warmup_logs = federated_train_sae(
+                args=args,
+                global_model=global_model,
+                global_sae=global_sae,
+                train_dl_global=train_dl_global,
+                partition_idx_map=partition_idx_map,
+                device=device,
+                emb_feat=label_text_features,
+                clip_model=clip_model,
+                sae_rounds=sae_warmup_rounds,
+                sae_local_epochs=sae_warmup_local_epochs,
+                sae_lr=sae_lr,
+                l1_lambda=sae_l1_lambda,
+                selective_lambda=sae_selective_lambda,
+                overlap_lambda=sae_overlap_lambda,
+                coupling_topm=sae_coupling_topm,
+            )
+            os.makedirs(os.path.dirname(sae_warmup_path), exist_ok=True)
+            os.makedirs(args.results_new, exist_ok=True)
+            torch.save(global_sae.cpu().state_dict(), sae_warmup_path)
+            with open(sae_warmup_log_path, "w") as f:
+                json.dump(sae_warmup_logs, f, indent=2)
+
+            print(f"Federated SAE warmup saved to: {sae_warmup_path}")
+            print(f"SAE warmup round logs saved to: {sae_warmup_log_path}")
+        else:
+            print(f"SAE warmup checkpoint already exists, skip warmup: {sae_warmup_path}")
+
+        args.sae_ckpt = sae_warmup_path
+        args.sae_input_dim = sae_input_dim
+        args.sae_latent_dim = sae_latent_dim
+        args.sae_activation = sae_activation
+        args.sae_use_layer_norm = True
     else:
-        print(f"SAE warmup checkpoint already exists, skip warmup: {sae_warmup_path}")
+        print("==== SAE disabled: use raw label embeddings directly ====")
+        args.sae_ckpt = None
+        args.sae_input_dim = sae_input_dim
+        args.sae_latent_dim = sae_input_dim
+        args.sae_activation = "identity"
+        args.sae_use_layer_norm = False
 
-    final_sae_path = sae_warmup_path
-    if use_sae_distill and not os.path.exists(sae_distill_path):
-        print("==== Start federated SAE distillation ====")
-        global_sae = SparseAutoEncoder(
-            input_dim=sae_input_dim,
-            latent_dim=sae_latent_dim,
-            activation=sae_activation,
-        )
-        global_sae.load_state_dict(torch.load(sae_warmup_path, map_location="cpu"))
-
-        global_sae, sae_round_logs = federated_train_sae_with_distill(
-            args=args,
-            global_model=global_model,
-            global_sae=global_sae,
-            train_dl_global=train_dl_global,
-            partition_idx_map=partition_idx_map,
-            device=device,
-            emb_feat=label_text_features,
-            clip_model=clip_model,
-            sae_rounds=sae_rounds,
-            sae_local_epochs=sae_local_epochs,
-            sae_lr=sae_lr,
-            l1_lambda=sae_l1_lambda,
-            distill_lambda=sae_distill_lambda,
-            selective_lambda=sae_selective_lambda,
-            overlap_lambda=sae_overlap_lambda,
-            coupling_topm=sae_coupling_topm,
-            distill_type=sae_distill_type,
-        )
-
-        os.makedirs(os.path.dirname(sae_distill_path), exist_ok=True)
-        os.makedirs(args.results_new, exist_ok=True)
-        torch.save(global_sae.cpu().state_dict(), sae_distill_path)
-        with open(sae_round_log_path, "w") as f:
-            json.dump(sae_round_logs, f, indent=2)
-
-        print(f"Federated distilled SAE saved to: {sae_distill_path}")
-        print(f"SAE distillation round logs saved to: {sae_round_log_path}")
-        final_sae_path = sae_distill_path
-    elif use_sae_distill:
-        print(f"Federated distilled SAE checkpoint already exists, skip training: {sae_distill_path}")
-        final_sae_path = sae_distill_path
-    else:
-        print("==== SAE distillation disabled, use warmup SAE directly ====")
-        final_sae_path = sae_warmup_path
-
-    args.sae_ckpt = final_sae_path
-    args.sae_input_dim = sae_input_dim
-    args.sae_latent_dim = sae_latent_dim
-    args.sae_activation = sae_activation
     args.sae_selective_lambda = sae_selective_lambda
     args.sae_overlap_lambda = sae_overlap_lambda
     args.sae_coupling_topm = sae_coupling_topm
     args.topk_coupling_lambda = topk_coupling_lambda
-    args.sae_use_layer_norm = True
 
     # ====== 联邦单类遗忘（完整版） + 按类别表格 ======
     do_unlearn = True
@@ -708,7 +663,7 @@ if __name__ == '__main__':
                 K=K,
                 unlearn_rounds=3,
                 client_frac=1.0,
-                unlearn_epochs=4,
+                unlearn_epochs=2,
                 unlearn_lr=1e-4,
                 lambda_keep=2.0,
                 lambda_forget_logit=0.0,
@@ -740,6 +695,7 @@ if __name__ == '__main__':
         print(f"CF1(after):   {test_metrics_after['CF1']:.3f}")
         print(f"OF1(after):   {test_metrics_after['OF1']:.3f}")
 
+        os.makedirs(args.results_new, exist_ok=True)
         csv_path_unlearn = os.path.join(
             args.results_new,
             f"new_{csv_prefix}_cls{forget_cls}_per_class_report.csv"
@@ -779,8 +735,17 @@ if __name__ == '__main__':
             print(f"O_mAP(after_recovery): {test_metrics_rec['O_mAP']:.3f}")
             print(f"CF1(after_recovery):   {test_metrics_rec['CF1']:.3f}")
             print(f"OF1(after_recovery):   {test_metrics_rec['OF1']:.3f}")
+        elif getattr(args, "recovery_mode", "strict") == "none":
+            print("==== Skip recovery because recovery_mode=none ====")
+            all_preds_rec, all_targs_rec, all_masks_rec, all_ids_rec = all_preds_after, all_targs_after, all_masks_a, all_ids_a
+            test_loss_rec, test_loss_unk_rec = test_loss_a, test_loss_unk_a
+            test_metrics_rec = test_metrics_after
+            print(f"mAP(after_recovery):   {test_metrics_rec['mAP']:.3f}")
+            print(f"O_mAP(after_recovery): {test_metrics_rec['O_mAP']:.3f}")
+            print(f"CF1(after_recovery):   {test_metrics_rec['CF1']:.3f}")
+            print(f"OF1(after_recovery):   {test_metrics_rec['OF1']:.3f}")
         else:
-            global_model = federated_recovery_simple(
+            global_model = federated_recovery_no_target_samples(
                 args=args,
                 global_model=global_model,
                 nets=nets,
@@ -847,6 +812,7 @@ if __name__ == '__main__':
         print("非目标类均值 before:", summary["others_mean_before"])
         print("非目标类均值 after :", summary["others_mean_after"])
 
+    os.makedirs(args.results_new, exist_ok=True)
     csv_path = os.path.join(args.results_new, "test_metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(

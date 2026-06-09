@@ -2,7 +2,6 @@ import torch
 import argparse
 import numpy as np
 
-from fed_unlearn_vis_projector import federated_unlearn_one_class_vis_projector
 from load_data import get_data
 from models import CTranModel
 from config_args import get_args
@@ -25,7 +24,7 @@ from scipy.special import softmax
 
 from fed_unlearn_topklogit import federated_unlearn_one_class_topklogit
 from ulearn.per_class_report import save_voc_per_class_report_csv
-from ulearn.recovery_train_simple import federated_recovery_simple
+from ulearn.recovery_train import federated_recovery_no_target_samples
 
 
 def init_nets(args, is_global=False, state_weight=None, label_weight=None):
@@ -593,7 +592,7 @@ if __name__ == '__main__':
             K=K,
             unlearn_rounds=3,
             client_frac=1.0,
-            unlearn_epochs=4,
+            unlearn_epochs=2,
             unlearn_lr=1e-4,
             lambda_keep=30.0,
             lambda_forget_logit=0.0,
@@ -627,6 +626,7 @@ if __name__ == '__main__':
         print(f"OF1(after):   {test_metrics_after['OF1']:.3f}")
 
         # ---------------- 5. 忘却前 vs 忘却后 per-class CSV ----------------
+        os.makedirs(args.results_new, exist_ok=True)
         csv_path_unlearn = os.path.join(
             args.results_new,
             f"new_{csv_prefix}_cls{forget_cls}_per_class_report.csv"
@@ -661,18 +661,21 @@ if __name__ == '__main__':
         # ---------------- 6. 联邦恢复阶段（不看目标类正样本） ----------------
 
         # 3) 联邦恢复（只修复非目标类）
-        global_model = federated_recovery_simple(
-            args=args,
-            global_model=global_model,
-            nets=nets,
-            train_dl_global=train_dl_global,
-            partition_idx_map=partition_idx_map,
-            device=device,
-            emb_feat=label_text_features,
-            clip_model=clip_model,
-            forget_cls=forget_cls,
-            recovery_rounds=2,  # 你说先试两轮
-        )
+        if getattr(args, "recovery_mode", "strict") != "none":
+            global_model = federated_recovery_no_target_samples(
+                args=args,
+                global_model=global_model,
+                nets=nets,
+                train_dl_global=train_dl_global,
+                partition_idx_map=partition_idx_map,
+                device=device,
+                emb_feat=label_text_features,
+                clip_model=clip_model,
+                forget_cls=forget_cls,
+                recovery_rounds=2,  # 你说先试两轮
+            )
+        else:
+            print("==== Skip recovery because recovery_mode=none ====")
         # ---------------- 7. 恢复后评估 ----------------
         print("==== Evaluate global model AFTER RECOVERY ====")
         all_preds_rec, all_targs_rec, all_masks_rec, all_ids_rec, test_loss_rec, test_loss_unk_rec = run_epoch(
@@ -731,6 +734,7 @@ if __name__ == '__main__':
         print("非目标类均值 before:", summary["others_mean_before"])
         print("非目标类均值 after :", summary["others_mean_after"])
     # ====== 原来的 test_metrics.csv 保存逻辑保持不动 ======
+    os.makedirs(args.results_new, exist_ok=True)
     csv_path = os.path.join(args.results_new, "test_metrics.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(

@@ -39,6 +39,19 @@ def get_args(parser,eval=False):
         help='penalty weight for subtracting high-coupling label responses in top-K scoring'
     )
     parser.add_argument(
+        '--use_sae',
+        dest='use_sae',
+        action='store_true',
+        help='use SAE latent space for top-K / rerank / subspace / one-shot forgetting'
+    )
+    parser.add_argument(
+        '--no-use-sae',
+        dest='use_sae',
+        action='store_false',
+        help='bypass SAE and operate directly on raw label embeddings'
+    )
+    parser.set_defaults(use_sae=True)
+    parser.add_argument(
         '--topk_candidate_mul',
         type=float,
         default=2.0,
@@ -128,9 +141,15 @@ def get_args(parser,eval=False):
         help='optional extra bias shift on forget class logit during one-shot nulling'
     )
     parser.add_argument(
-        '--disable_sae_distill',
+        '--subspace_param_unlearn',
         action='store_true',
-        help='skip federated SAE distillation and use warmup SAE directly for unlearning'
+        help='use subspace-guided parameter unlearning loss instead of the original feature-shrink/hard-negative forget loss'
+    )
+    parser.add_argument(
+        '--subspace_align_weight',
+        type=float,
+        default=0.0,
+        help='optional weight for pulling forget-class positive features toward the negative-class center during subspace-guided parameter unlearning'
     )
     # Optimization
     parser.add_argument('--optim', type=str, choices=['adam', 'sgd', 'adamw'], default='adam')
@@ -185,6 +204,13 @@ def get_args(parser,eval=False):
         type=float,
         default=2.0,
         help="恢复阶段非目标类正样本的损失权重，用来提高 Recall/F1"
+    )
+    parser.add_argument(
+        "--recovery_mode",
+        type=str,
+        choices=["strict", "none"],
+        default="strict",
+        help="恢复阶段模式：strict 使用 recovery_train.py；none 直接跳过 recovery"
     )
     # FLAIR
     parser.add_argument('--flair_fine', action='store_true', help='whether use the fine-grained labels defined in FLAIR.')
@@ -373,7 +399,8 @@ def get_args(parser,eval=False):
     
     if os.path.exists(args.model_name) and (not args.overwrite) and (not 'test' in args.name) and (not eval) and (not args.inference) and (not args.resume):
         print(args.model_name)
-        overwrite_status = input('Already Exists. Overwrite?: ')
+        overwrite_status = 'y'
+        print('Already Exists. Overwrite?: y')
         if overwrite_status == 'rm':
             os.system('rm -rf '+args.model_name)
         elif not 'y' in overwrite_status:

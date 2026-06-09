@@ -12,6 +12,10 @@ _GLOBAL_SAE_MODEL = None
 _GLOBAL_SAE_CKPT = None
 
 
+def _using_sae(args):
+    return bool(getattr(args, "use_sae", True))
+
+
 def _get_sae_model(args, device):
     """
     懒加载 SAE，不改原函数签名。
@@ -24,6 +28,9 @@ def _get_sae_model(args, device):
     """
     global _GLOBAL_SAE_MODEL, _GLOBAL_SAE_CKPT
 
+    if not _using_sae(args):
+        return None
+
     sae_ckpt = getattr(args, "sae_ckpt", None)
     input_dim = getattr(args, "sae_input_dim", 512)
     latent_dim = getattr(args, "sae_latent_dim", 1024)
@@ -32,7 +39,7 @@ def _get_sae_model(args, device):
     if sae_ckpt is None:
         raise ValueError(
             "args.sae_ckpt is required. "
-            "Please set for example: args.sae_ckpt = 'ulearn_model/fed_sae_distill.pth'"
+            "Please set for example: args.sae_ckpt = 'ulearn/sae_512_to_1024_xxx.pth'"
         )
 
     # 如果缓存存在且 ckpt 路径没变，直接返回
@@ -60,6 +67,12 @@ def _get_sae_model(args, device):
     return _GLOBAL_SAE_MODEL
 
 
+def _get_analysis_dim(model, sae_model):
+    if sae_model is not None:
+        return sae_model.latent_dim
+    return int(model.output_linear.weight.size(1))
+
+
 def _encode_label_emb_with_sae(label_emb, sae_model, args=None):
     """
     label_emb: (B, L, D_raw)
@@ -70,6 +83,9 @@ def _encode_label_emb_with_sae(label_emb, sae_model, args=None):
     联邦蒸馏训练 SAE 时，对输入 feat 做了 layer norm。
     这里必须保持一致，否则训练/使用分布不一致。
     """
+    if sae_model is None:
+        return label_emb
+
     B, L, D_raw = label_emb.shape
     label_emb_flat = label_emb.reshape(B * L, D_raw)
 
@@ -96,7 +112,7 @@ def collect_topk_dims_for_class(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    latent_dim = sae_model.latent_dim
+    latent_dim = _get_analysis_dim(model, sae_model)
     beta_neg = 0.5   # 你可以后面再调
     coupling_topm = getattr(args, "sae_coupling_topm", 5)
     coupling_penalty_lambda = getattr(args, "topk_coupling_lambda", 0.5)
@@ -201,8 +217,11 @@ def collect_topk_dims_for_class(
     # ===== 分类头权重投影到 latent 空间 =====
     with torch.no_grad():
         W_c_raw = model.output_linear.weight[forget_cls].to(device)   # (D_raw,)
-        W_enc = sae_model.encoder.weight.to(device)                   # (latent_dim, D_raw)
-        W_c_latent = torch.matmul(W_enc, W_c_raw)                     # (latent_dim,)
+        if sae_model is None:
+            W_c_latent = W_c_raw
+        else:
+            W_enc = sae_model.encoder.weight.to(device)               # (latent_dim, D_raw)
+            W_c_latent = torch.matmul(W_enc, W_c_raw)                 # (latent_dim,)
 
     score = base_score * W_c_latent.abs()
 
@@ -282,7 +301,7 @@ def collect_client_topk_stats(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    latent_dim = sae_model.latent_dim
+    latent_dim = _get_analysis_dim(model, sae_model)
 
     pos_sum = torch.zeros(latent_dim, device=device)
     neg_sum = torch.zeros(latent_dim, device=device)
@@ -364,26 +383,40 @@ def aggregate_topk_score_from_client_stats(
     """
     服务器只基于客户端上传的 top-K 统计量恢复全局 score。
     """
+    # sae模型
     sae_model = _get_sae_model(args, device)
-    latent_dim = sae_model.latent_dim
+    # 空间维度，用sae就是1024维，不用sae就是512维
+    latent_dim = _get_analysis_dim(model, sae_model)
+    # 权重系数
     beta_neg = 0.5
+    # 最多取多少个和目标类最容易一起出现的标签，高共现标签的数量
     coupling_topm = getattr(args, "sae_coupling_topm", 5)
+    # 高贡献类惩罚权重
     coupling_penalty_lambda = getattr(args, "topk_coupling_lambda", 0.5)
-
+    # 长度为 latent_dim 的一维向量
     pos_sum = torch.zeros(latent_dim, device=device)
     neg_sum = torch.zeros(latent_dim, device=device)
+    # 目标类正样本一共有多少个
     pos_cnt = 0
+    # 目标类负样本一共有多少个
     neg_cnt = 0
+    # 每个类别在每个维度上的激活总和
     class_pos_sum = None
+    # 每个类别分别有多少个正样本
     class_pos_cnt = None
+    # 目标类正样本里，其他标签一共出现了多少次
     cooccur_counts = None
+    # 总共有多少个标签
     num_labels = None
 
     for s in client_stats:
         pos_sum += s["pos_sum"].to(device)
         neg_sum += s["neg_sum"].to(device)
+        # 全局整样本总数
         pos_cnt += int(s["pos_cnt"])
+        # 全局负样本总数
         neg_cnt += int(s["neg_cnt"])
+        # 开始统计每一个客户端的样本数进行相加
         if class_pos_sum is None:
             num_labels = int(s["num_labels"])
             class_pos_sum = s["class_pos_sum"].to(device)
@@ -402,6 +435,7 @@ def aggregate_topk_score_from_client_stats(
     class_mean = class_pos_sum / (class_pos_cnt.unsqueeze(1) + 1e-6)
     cooccur_counts[forget_cls] = 0.0
 
+    # 找出最强竞争类别
     competitor_mean = class_mean.clone()
     competitor_mean[forget_cls] = -1e9
     max_comp_mean, max_comp_cls = competitor_mean.max(dim=0)
@@ -410,8 +444,11 @@ def aggregate_topk_score_from_client_stats(
 
     with torch.no_grad():
         W_c_raw = model.output_linear.weight[forget_cls].to(device)
-        W_enc = sae_model.encoder.weight.to(device)
-        W_c_latent = torch.matmul(W_enc, W_c_raw)
+        if sae_model is None:
+            W_c_latent = W_c_raw
+        else:
+            W_enc = sae_model.encoder.weight.to(device)
+            W_c_latent = torch.matmul(W_enc, W_c_raw)
 
     score = base_score * W_c_latent.abs()
 
@@ -494,7 +531,8 @@ def rerank_topk_dims_with_gradient(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()
+    if sae_model is not None:
+        sae_model.eval()
 
     candidate_idx = candidate_idx.to(device)
     candidate_score = candidate_score.to(device)
@@ -607,7 +645,7 @@ def rerank_topk_dims_with_gradient(
 
     return final_idx.detach(), final_weight.detach()
 
-
+# 用处不大
 def collect_client_rerank_stats(
     model,
     dataloader,
@@ -629,10 +667,13 @@ def collect_client_rerank_stats(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()
+    if sae_model is not None:
+        sae_model.eval()
 
+    # 没用了
     candidate_idx = candidate_idx.to(device)
     M = candidate_idx.numel()
+
     importance_sum = torch.zeros(M, device=device)
     sample_count = 0
     z_sum = torch.zeros(M, device=device)
@@ -660,7 +701,7 @@ def collect_client_rerank_stats(
             clip_model,
             return_label_emb=True,
         )
-
+        # 这没啥用了
         z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)
         if not z_all.requires_grad:
             continue
@@ -673,7 +714,9 @@ def collect_client_rerank_stats(
 
         if neg_idx.any():
             z_neg = z_f[neg_idx][:, candidate_idx]
+            # 负样本在候选维度上的平均位置
             mu_neg = z_neg.detach().mean(dim=0, keepdim=True)
+            # 让目标类正样本在候选维上的值整体变小的同时让目标类正样本往负样本中心靠近
             rank_loss = 0.8 * (z_pos ** 2).mean() + 0.2 * ((z_pos - mu_neg) ** 2).mean()
         else:
             rank_loss = (z_pos ** 2).mean()
@@ -796,7 +839,8 @@ def estimate_target_subspace(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()
+    if sae_model is not None:
+        sae_model.eval()
 
     topk_idx = topk_idx.to(device)
     if topk_weights is not None:
@@ -878,7 +922,7 @@ def estimate_target_subspace(
 
     return basis.detach(), neg_center.detach()
 
-
+# 这个有用
 def collect_client_target_subspace_stats(
     model,
     dataloader,
@@ -902,8 +946,10 @@ def collect_client_target_subspace_stats(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()
+    if sae_model is not None:
+        sae_model.eval()
 
+    # 没用
     topk_idx = topk_idx.to(device)
     if topk_weights is not None:
         topk_weights = topk_weights.detach().to(device).view(1, -1)
@@ -914,7 +960,9 @@ def collect_client_target_subspace_stats(
     K = topk_idx.numel()
     pos_count = 0
     neg_count = 0
+    # 512维的全0向量，看一个目标类正样本，就把它在 512 个维度上的值，加到这个表里
     pos_sum = torch.zeros(K, device=device)
+    # 二阶矩
     pos_xxt = torch.zeros(K, K, device=device)
     neg_sum = torch.zeros(K, device=device)
 
@@ -939,6 +987,8 @@ def collect_client_target_subspace_stats(
 
             z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)
             z_f = z_all[:, forget_cls, :][:, topk_idx]
+
+            # 没用
             if metric_scale is not None:
                 z_f = z_f * metric_scale
 
@@ -1009,8 +1059,9 @@ def aggregate_target_subspace_from_stats(
         + torch.outer(center, center)
     )
     cov = 0.5 * (cov + cov.t())
-
+    # 512维
     K = cov.size(0)
+    # 至少取 1 个方向，不能超过当前空间维度 K
     rank_eff = max(1, min(int(subspace_rank), K))
 
     evals, evecs = torch.linalg.eigh(cov)
@@ -1066,7 +1117,8 @@ def unlearn_one_class_on_model_topk_logit(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()  # SAE 固定，不参与训练
+    if sae_model is not None:
+        sae_model.eval()  # SAE 固定，不参与训练
 
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
@@ -1193,7 +1245,8 @@ def unlearn_one_class_on_model(
     model.to(device)
 
     sae_model = _get_sae_model(args, device)
-    sae_model.eval()  # SAE 固定，不参与训练
+    if sae_model is not None:
+        sae_model.eval()  # SAE 固定，不参与训练
 
     topk_idx = topk_idx.to(device)
     D = topk_idx.numel()
@@ -1203,11 +1256,18 @@ def unlearn_one_class_on_model(
     shrink_w = float(getattr(args, "forget_shrink_weight", 0.3))
     pull_w = float(getattr(args, "forget_pull_weight", 0.7))
     subspace_w = float(getattr(args, "forget_subspace_weight", 0.4))
+    use_subspace_param_unlearn = bool(getattr(args, "subspace_param_unlearn", False))
+    align_w = float(getattr(args, "subspace_align_weight", 0.0))
     if topk_subspace_basis is not None:
         topk_subspace_basis = topk_subspace_basis.detach().to(device)
     if topk_subspace_center is not None:
         topk_subspace_center = topk_subspace_center.detach().to(device)
     print("【保护版】只更新 head(Person) + backbone.layer4")
+    if use_subspace_param_unlearn:
+        print(
+            f"【子空间参数遗忘】启用纯 feature-level 子空间遗忘 "
+            f"(subspace_w={subspace_w:.3f}, align_w={align_w:.3f})"
+        )
 
     # ===== ① 先把所有参数默认冻结 =====
     for p in model.parameters():
@@ -1287,6 +1347,10 @@ def unlearn_one_class_on_model(
 
             # ===== 映射到 SAE latent 空间 =====
             z_all = _encode_label_emb_with_sae(label_emb, sae_model, args)   # (B, L, latent_dim)
+            if (not torch.isfinite(logits).all()) or (not torch.isfinite(z_all).all()):
+                print(f"[Warn] Non-finite logits/latent detected at ep={ep}, step={step}; skip batch.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             # 1) 保护其它类别：只在非目标类上算 BCE
             bce_all = F.binary_cross_entropy_with_logits(
@@ -1313,45 +1377,68 @@ def unlearn_one_class_on_model(
             pos_idx = (labels[:, forget_cls] == 1)
             neg_idx = (labels[:, forget_cls] == 0)
 
-            if pos_idx.any() and neg_idx.any():
+            subspace_ready = use_subspace_param_unlearn and (topk_subspace_basis is not None)
+            if pos_idx.any() and (neg_idx.any() or subspace_ready):
                 z_pos = z_f[pos_idx]
-                z_neg = z_f[neg_idx]
-
                 z_pos_topk = z_pos[:, topk_idx]
-                z_neg_topk = z_neg[:, topk_idx]
 
                 if topk_weights is None:
-                    loss_shrink = (z_pos_topk ** 2).mean()
                     z_pos_metric = z_pos_topk
-                    z_neg_metric = z_neg_topk
                 else:
-                    loss_shrink = ((z_pos_topk ** 2) * topk_weights).sum(dim=1).mean()
                     metric_scale = topk_weights.sqrt()
                     z_pos_metric = z_pos_topk * metric_scale
-                    z_neg_metric = z_neg_topk * metric_scale
 
-                # 对每个正样本，只拉向 batch 内最接近的几个负样本，而不是负样本均值。
-                dist_mat = torch.cdist(z_pos_metric, z_neg_metric, p=2) ** 2   # (N_pos, N_neg)
-                topn = min(hardneg_topn, dist_mat.size(1))
-                hardneg_dist = torch.topk(dist_mat, k=topn, largest=False, dim=1).values
-                loss_pull_neg = hardneg_dist.mean()
-
-                if topk_subspace_basis is not None:
+                if subspace_ready:
                     if topk_subspace_center is None:
-                        z_centered = z_pos_metric
+                        center_metric = torch.zeros(
+                            (1, z_pos_metric.size(1)),
+                            device=device,
+                            dtype=z_pos_metric.dtype,
+                        )
                     else:
-                        z_centered = z_pos_metric - topk_subspace_center
-                    proj = z_centered @ topk_subspace_basis
-                    loss_subspace = (proj ** 2).sum(dim=1).mean()
+                        center_metric = topk_subspace_center
+                    z_centered = z_pos_metric - center_metric
+                    coeff = z_centered @ topk_subspace_basis
+                    loss_subspace = (coeff ** 2).mean()
+                    loss_align = ((z_pos_metric - center_metric) ** 2).mean()
+                    norm = max(subspace_w + align_w, 1e-6)
+                    loss_forget_feat = (
+                        (subspace_w / norm) * loss_subspace +
+                        (align_w / norm) * loss_align
+                    )
                 else:
-                    loss_subspace = torch.tensor(0.0, device=device)
+                    z_neg = z_f[neg_idx]
+                    z_neg_topk = z_neg[:, topk_idx]
+                    if topk_weights is None:
+                        loss_shrink = (z_pos_topk ** 2).mean()
+                        z_neg_metric = z_neg_topk
+                    else:
+                        loss_shrink = ((z_pos_topk ** 2) * topk_weights).sum(dim=1).mean()
+                        metric_scale = topk_weights.sqrt()
+                        z_neg_metric = z_neg_topk * metric_scale
 
-                norm = max(shrink_w + pull_w + subspace_w, 1e-6)
-                loss_forget_feat = (
-                    (shrink_w / norm) * loss_shrink +
-                    (pull_w / norm) * loss_pull_neg +
-                    (subspace_w / norm) * loss_subspace
-                )
+                    # 对每个正样本，只拉向 batch 内最接近的几个负样本，而不是负样本均值。
+                    dist_mat = torch.cdist(z_pos_metric, z_neg_metric, p=2) ** 2   # (N_pos, N_neg)
+                    topn = min(hardneg_topn, dist_mat.size(1))
+                    hardneg_dist = torch.topk(dist_mat, k=topn, largest=False, dim=1).values
+                    loss_pull_neg = hardneg_dist.mean()
+
+                    if topk_subspace_basis is not None:
+                        if topk_subspace_center is None:
+                            z_centered = z_pos_metric
+                        else:
+                            z_centered = z_pos_metric - topk_subspace_center
+                        proj = z_centered @ topk_subspace_basis
+                        loss_subspace = (proj ** 2).sum(dim=1).mean()
+                    else:
+                        loss_subspace = torch.tensor(0.0, device=device)
+
+                    norm = max(shrink_w + pull_w + subspace_w, 1e-6)
+                    loss_forget_feat = (
+                        (shrink_w / norm) * loss_shrink +
+                        (pull_w / norm) * loss_pull_neg +
+                        (subspace_w / norm) * loss_subspace
+                    )
             else:
                 loss_forget_feat = torch.tensor(0.0, device=device)
 
@@ -1360,6 +1447,13 @@ def unlearn_one_class_on_model(
                 0 * loss_forget_logit +
                 lambda_forget_feat * loss_forget_feat
             )
+            if not torch.isfinite(loss):
+                print(
+                    f"[Warn] Non-finite loss at ep={ep}, step={step}: "
+                    f"keep={loss_keep.item():.6f}, feat={loss_forget_feat.item():.6f}. Skip batch."
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)

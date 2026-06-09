@@ -123,19 +123,22 @@ class CTranModel(nn.Module):
     def _apply_forget_projection(self, label_embeddings):
         if not self._forget_proj_enabled:
             return label_embeddings
-        if self._forget_proj_sae is None or self._forget_proj_basis is None or self._forget_proj_topk_idx is None:
+        if self._forget_proj_basis is None or self._forget_proj_topk_idx is None:
             return label_embeddings
 
         forget_cls = self._forget_proj_forget_cls
         if forget_cls is None or forget_cls < 0 or forget_cls >= label_embeddings.size(1):
             return label_embeddings
 
-        sae_model = self._forget_proj_sae.to(label_embeddings.device)
-        sae_model.eval()
-
         x = label_embeddings[:, forget_cls, :]
-        x_in = F.layer_norm(x, x.shape[-1:]) if self._forget_proj_use_layer_norm else x
-        z = sae_model.encode(x_in)
+        sae_model = self._forget_proj_sae
+        if sae_model is not None:
+            sae_model = sae_model.to(label_embeddings.device)
+            sae_model.eval()
+            x_in = F.layer_norm(x, x.shape[-1:]) if self._forget_proj_use_layer_norm else x
+            z = sae_model.encode(x_in)
+        else:
+            z = x
 
         topk_idx = self._forget_proj_topk_idx.to(label_embeddings.device).long()
         z_topk = z[:, topk_idx]
@@ -155,7 +158,9 @@ class CTranModel(nn.Module):
         )
 
         centered = z_metric - center
+        # 样本在每条目标类主方向上有多少
         coeff = centered @ basis
+        # 把这些方向成分重新拼起来后，样本里属于目标类主子空间的那部分
         proj = coeff @ basis.transpose(0, 1)
         z_metric_new = centered - self._forget_proj_alpha * proj + center
 
@@ -166,7 +171,10 @@ class CTranModel(nn.Module):
 
         z_new = z.clone()
         z_new[:, topk_idx] = z_topk_new
-        x_hat = sae_model.decode(z_new)
+        if sae_model is not None:
+            x_hat = sae_model.decode(z_new)
+        else:
+            x_hat = z_new
 
         label_embeddings = label_embeddings.clone()
         label_embeddings[:, forget_cls, :] = x_hat
